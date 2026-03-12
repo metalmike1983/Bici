@@ -1,510 +1,458 @@
 # ============================================================
-# SCORING + PROFILAZIONE CLIENTI TAPPETO
-# Versione Jupyter-friendly
+# CLUSTER TAPPETO - ANALISI PROFILO CLIENTI + MODELLO SALVABILE
+# Versione ottimizzata
 # ============================================================
 
-import re
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
 import pandas as pd
+import joblib
 
-from IPython.display import display, Markdown
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-CONFIG = {
-    # ===== input =====
-    "path_xlsx": r"C:\path\tuo_file.xlsx",   # <--- CAMBIA QUI
-    "sheet_name": 0,                         # nome sheet o indice
-
-    # ===== colonne attese =====
-    "col_ndg": "ndg",
-    "col_month": "MESE",
-    "col_cluster": "Cluster",
-
-    # ===== output =====
-    "output_scored": "ndg_scored_tappeto.xlsx",
-    "output_profile": "profilazione_clienti_tappeto.xlsx",
-
-    # ===== profiling opzionale su variabili originali =====
-    # metti qui eventuali colonne categoriche del dataset sorgente
-    "profile_categorical_cols": [
-        "Cluster",
-        # "Segmento",
-        # "Area",
-        # "Filiale",
-        # "Prodotto",
-        # "Canale",
-    ],
-
-    # metti qui eventuali colonne numeriche del dataset sorgente
-    "profile_numeric_cols": [
-        # "eta",
-        # "saldo",
-        # "giacenza_media",
-        # "n_prodotti",
-    ],
-}
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.feature_selection import mutual_info_classif
 
 # ============================================================
-# FUNZIONI UTILI JUPYTER
+# PARAMETRI UTENTE
 # ============================================================
 
-def h1(txt):
-    display(Markdown(f"# {txt}"))
+INPUT_FILE = r"C:\percorso\tuo_file.xlsx"   # <-- cambia qui
+SHEET_NAME = 0                              # oppure nome foglio
+TARGET_COL = "tappeto"                      # <-- variabile target
+ID_COL = None                               # es. "ndg" se vuoi escluderla dalle feature
+OUTPUT_DIR = r"C:\percorso\output_tappeto"  # <-- cambia qui
 
-def h2(txt):
-    display(Markdown(f"## {txt}"))
+# colonne da escludere a priori se presenti
+EXCLUDE_COLS = [
+    TARGET_COL
+]
 
-def h3(txt):
-    display(Markdown(f"### {txt}"))
+if ID_COL is not None:
+    EXCLUDE_COLS.append(ID_COL)
 
-def show(df, n=10):
-    display(df.head(n))
+# soglie utili
+MIN_UNIQUE_FOR_NUMERIC = 15     # se una colonna numerica ha pochissimi valori distinti, può essere trattata come categorica
+TOP_N_CATEGORY_LEVELS = 15      # per output profilo categorie
+TEST_SIZE = 0.30
+RANDOM_STATE = 42
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ============================================================
-# NORMALIZZAZIONE NOMI COLONNA
+# LETTURA DATI
 # ============================================================
 
-def normalize_columns(df):
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+def load_data(file_path, sheet_name=0):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in [".xlsx", ".xlsm", ".xls"]:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+    elif ext == ".csv":
+        df = pd.read_csv(file_path)
+    else:
+        raise ValueError(f"Formato file non supportato: {ext}")
     return df
 
-def resolve_column(df, wanted_name):
-    """
-    Cerca una colonna in modo robusto:
-    - match esatto
-    - match case-insensitive
-    - match trimmed/lower
-    """
-    cols = list(df.columns)
+df = load_data(INPUT_FILE, SHEET_NAME)
 
-    if wanted_name in cols:
-        return wanted_name
-
-    lower_map = {str(c).strip().lower(): c for c in cols}
-    key = str(wanted_name).strip().lower()
-
-    if key in lower_map:
-        return lower_map[key]
-
-    raise KeyError(f"Colonna non trovata: {wanted_name}. Colonne disponibili: {cols}")
+print("=" * 80)
+print("DATASET CARICATO")
+print("=" * 80)
+print(f"Shape iniziale: {df.shape}")
+print(df.head())
 
 # ============================================================
-# PARSE MESE
-# Supporta:
-# - ott-25
-# - ott/25
-# - ott 25
-# - Oct-25
-# - 2025-10
-# - 10/2025
-# - datetime già valido
+# CONTROLLI PRELIMINARI
 # ============================================================
 
-MONTH_MAP_IT = {
-    "gen": 1, "feb": 2, "mar": 3, "apr": 4, "mag": 5, "giu": 6,
-    "lug": 7, "ago": 8, "set": 9, "ott": 10, "nov": 11, "dic": 12
-}
+if TARGET_COL not in df.columns:
+    raise ValueError(f"La colonna target '{TARGET_COL}' non esiste nel dataset.")
 
-MONTH_MAP_EN = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
-}
+# pulizia nomi colonne
+df.columns = [str(c).strip() for c in df.columns]
 
-def parse_month_to_period(x):
-    if pd.isna(x):
-        return pd.NaT
+# target pulito
+df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce")
 
-    # caso datetime / timestamp
-    if isinstance(x, (pd.Timestamp, np.datetime64)):
-        try:
-            ts = pd.to_datetime(x, errors="coerce")
-            if pd.isna(ts):
-                return pd.NaT
-            return pd.Period(ts, freq="M")
-        except Exception:
-            return pd.NaT
+# teniamo solo righe con target valorizzato
+df = df[df[TARGET_COL].notna()].copy()
 
-    s = str(x).strip()
+# forziamo target intero
+df[TARGET_COL] = df[TARGET_COL].astype(int)
 
-    if s == "":
-        return pd.NaT
+print("\nDistribuzione target:")
+print(df[TARGET_COL].value_counts(dropna=False))
 
-    s_low = s.lower()
+if df.empty:
+    raise ValueError("Il dataset è vuoto dopo la pulizia del target.")
 
-    # 1) formato it/en tipo ott-25 / oct-25 / ott 25 / ott/25
-    m = re.match(r"^([a-z]{3})[-/ ](\d{2})$", s_low)
-    if m:
-        mon_txt = m.group(1)
-        yy = int(m.group(2))
-        month = MONTH_MAP_IT.get(mon_txt, MONTH_MAP_EN.get(mon_txt))
-        if month is not None:
-            year = 2000 + yy
-            return pd.Period(f"{year}-{month:02d}", freq="M")
+# ============================================================
+# COSTRUZIONE FEATURE SET
+# ============================================================
 
-    # 2) formato yyyy-mm
-    m = re.match(r"^(\d{4})-(\d{1,2})$", s_low)
-    if m:
-        year = int(m.group(1))
-        month = int(m.group(2))
-        if 1 <= month <= 12:
-            return pd.Period(f"{year}-{month:02d}", freq="M")
+candidate_features = [c for c in df.columns if c not in EXCLUDE_COLS]
 
-    # 3) formato mm/yyyy o m/yyyy
-    m = re.match(r"^(\d{1,2})/(\d{4})$", s_low)
-    if m:
-        month = int(m.group(1))
-        year = int(m.group(2))
-        if 1 <= month <= 12:
-            return pd.Period(f"{year}-{month:02d}", freq="M")
+# rimuovi colonne completamente vuote
+candidate_features = [c for c in candidate_features if df[c].notna().sum() > 0]
 
-    # 4) fallback con pandas
+X = df[candidate_features].copy()
+y = df[TARGET_COL].copy()
+
+# prova conversione numerica leggera su object che sembrano numeriche
+for col in X.columns:
+    if X[col].dtype == "object":
+        tmp = pd.to_numeric(X[col].astype(str).str.replace(",", "."), errors="coerce")
+        # converto solo se almeno il 70% dei valori è interpretabile come numero
+        if tmp.notna().mean() >= 0.70:
+            X[col] = tmp
+
+# riconoscimento colonne numeriche e categoriche
+numeric_cols = []
+categorical_cols = []
+
+for col in X.columns:
+    if pd.api.types.is_numeric_dtype(X[col]):
+        # se numerica ma con pochi valori distinti, può essere più sensata come categoria
+        nunique = X[col].nunique(dropna=True)
+        if nunique <= MIN_UNIQUE_FOR_NUMERIC:
+            categorical_cols.append(col)
+        else:
+            numeric_cols.append(col)
+    else:
+        categorical_cols.append(col)
+
+print("\nColonne numeriche:", numeric_cols)
+print("\nColonne categoriche:", categorical_cols)
+
+# ============================================================
+# ANALISI DESCRITTIVA DEL PROFILO TAPPETO = 1
+# ============================================================
+
+df_pos = df[df[TARGET_COL] == 1].copy()
+df_neg = df[df[TARGET_COL] == 0].copy()
+
+print("\n" + "=" * 80)
+print("PROFILO DESCRITTIVO CLIENTI CON TAPPETO = 1")
+print("=" * 80)
+print(f"Numero clienti tappeto=1: {len(df_pos)}")
+print(f"Numero clienti tappeto=0: {len(df_neg)}")
+
+# ---- Statistiche numeriche
+numeric_profile_rows = []
+
+for col in numeric_cols:
+    pos_mean = df_pos[col].mean()
+    neg_mean = df_neg[col].mean() if len(df_neg) > 0 else np.nan
+    pos_median = df_pos[col].median()
+    neg_median = df_neg[col].median() if len(df_neg) > 0 else np.nan
+    diff_mean = pos_mean - neg_mean if pd.notna(neg_mean) else np.nan
+
+    numeric_profile_rows.append({
+        "variabile": col,
+        "mean_tappeto_1": pos_mean,
+        "median_tappeto_1": pos_median,
+        "mean_tappeto_0": neg_mean,
+        "median_tappeto_0": neg_median,
+        "diff_mean": diff_mean
+    })
+
+numeric_profile_df = pd.DataFrame(numeric_profile_rows)
+
+if not numeric_profile_df.empty:
+    numeric_profile_df["abs_diff_mean"] = numeric_profile_df["diff_mean"].abs()
+    numeric_profile_df = numeric_profile_df.sort_values("abs_diff_mean", ascending=False)
+    print("\nTop differenze variabili numeriche:")
+    print(numeric_profile_df.head(20).drop(columns=["abs_diff_mean"]))
+else:
+    print("\nNessuna variabile numerica utile trovata.")
+
+# ---- Statistiche categoriche
+categorical_profile_all = []
+
+for col in categorical_cols:
+    tmp = (
+        df.groupby([col, TARGET_COL])
+          .size()
+          .reset_index(name="n")
+    )
+
+    pivot = tmp.pivot_table(index=col, columns=TARGET_COL, values="n", fill_value=0)
+    pivot.columns = [f"count_target_{int(c)}" for c in pivot.columns]
+    pivot = pivot.reset_index()
+
+    if "count_target_1" not in pivot.columns:
+        pivot["count_target_1"] = 0
+    if "count_target_0" not in pivot.columns:
+        pivot["count_target_0"] = 0
+
+    pivot["total"] = pivot["count_target_1"] + pivot["count_target_0"]
+    pivot["pct_tappeto_1_nel_livello"] = np.where(
+        pivot["total"] > 0,
+        pivot["count_target_1"] / pivot["total"],
+        np.nan
+    )
+    pivot["variabile"] = col
+
+    pivot = pivot.sort_values(
+        ["pct_tappeto_1_nel_livello", "count_target_1"],
+        ascending=[False, False]
+    )
+
+    categorical_profile_all.append(pivot.head(TOP_N_CATEGORY_LEVELS))
+
+if categorical_profile_all:
+    categorical_profile_df = pd.concat(categorical_profile_all, ignore_index=True)
+    print("\nTop livelli categorici associati a tappeto=1:")
+    print(categorical_profile_df.head(40))
+else:
+    categorical_profile_df = pd.DataFrame()
+    print("\nNessuna variabile categorica utile trovata.")
+
+# ============================================================
+# FEATURE IMPORTANCE DESCRITTIVA (MUTUAL INFORMATION)
+# ============================================================
+
+mi_results = []
+
+X_mi = X.copy()
+
+for col in X_mi.columns:
+    if X_mi[col].dtype == "object":
+        X_mi[col] = X_mi[col].astype(str).fillna("MISSING")
+        X_mi[col] = X_mi[col].astype("category").cat.codes
+    else:
+        X_mi[col] = X_mi[col].fillna(X_mi[col].median())
+
+try:
+    mi_scores = mutual_info_classif(X_mi, y, discrete_features='auto', random_state=RANDOM_STATE)
+    mi_df = pd.DataFrame({
+        "variabile": X_mi.columns,
+        "mutual_info_score": mi_scores
+    }).sort_values("mutual_info_score", ascending=False)
+
+    print("\nTop variabili per Mutual Information:")
+    print(mi_df.head(20))
+except Exception as e:
+    print("\nMutual Information non calcolabile:", e)
+    mi_df = pd.DataFrame(columns=["variabile", "mutual_info_score"])
+
+# ============================================================
+# MODELLO PREDITTIVO
+# ============================================================
+
+# Se c'è una sola classe, niente training: si salva solo analisi descrittiva
+if y.nunique() < 2:
+    print("\n" + "=" * 80)
+    print("ATTENZIONE: il target ha una sola classe.")
+    print("Non è possibile allenare LogisticRegression.")
+    print("Viene prodotta solo l'analisi descrittiva del profilo.")
+    print("=" * 80)
+
+    # salvataggi base
+    numeric_profile_df.to_excel(os.path.join(OUTPUT_DIR, "profilo_numerico_tappeto.xlsx"), index=False)
+    categorical_profile_df.to_excel(os.path.join(OUTPUT_DIR, "profilo_categorico_tappeto.xlsx"), index=False)
+    mi_df.to_excel(os.path.join(OUTPUT_DIR, "mutual_info_tappeto.xlsx"), index=False)
+
+    with pd.ExcelWriter(os.path.join(OUTPUT_DIR, "report_cluster_tappeto.xlsx"), engine="openpyxl") as writer:
+        numeric_profile_df.to_excel(writer, sheet_name="profilo_numerico", index=False)
+        categorical_profile_df.to_excel(writer, sheet_name="profilo_categorico", index=False)
+        mi_df.to_excel(writer, sheet_name="mutual_info", index=False)
+
+    print(f"\nReport salvato in: {OUTPUT_DIR}")
+
+else:
+    # train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y if y.nunique() > 1 else None
+    )
+
+    # preprocessing
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_cols),
+            ("cat", categorical_transformer, categorical_cols)
+        ],
+        remainder="drop"
+    )
+
+    # modello
+    model = LogisticRegression(
+        max_iter=3000,
+        class_weight="balanced",
+        solver="liblinear",
+        random_state=RANDOM_STATE
+    )
+
+    clf = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("model", model)
+    ])
+
+    clf.fit(X_train, y_train)
+
+    # predizioni
+    y_pred = clf.predict(X_test)
+    y_proba = clf.predict_proba(X_test)[:, 1]
+
+    print("\n" + "=" * 80)
+    print("VALUTAZIONE MODELLO")
+    print("=" * 80)
+    print("\nConfusion matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+    print("\nClassification report:")
+    print(classification_report(y_test, y_pred, digits=4))
+
     try:
-        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-        if pd.isna(dt):
-            return pd.NaT
-        return pd.Period(dt, freq="M")
-    except Exception:
-        return pd.NaT
+        auc = roc_auc_score(y_test, y_proba)
+        print(f"ROC AUC: {auc:.4f}")
+    except Exception as e:
+        print("ROC AUC non calcolabile:", e)
+        auc = np.nan
+
+    # ========================================================
+    # FEATURE IMPORTANCE DEL MODELLO
+    # ========================================================
+
+    # recupera nomi feature post one-hot
+    try:
+        feature_names = clf.named_steps["preprocessor"].get_feature_names_out()
+        coefficients = clf.named_steps["model"].coef_[0]
+
+        coef_df = pd.DataFrame({
+            "feature": feature_names,
+            "coefficient": coefficients,
+            "abs_coefficient": np.abs(coefficients)
+        }).sort_values("abs_coefficient", ascending=False)
+
+        print("\nTop feature del modello:")
+        print(coef_df.head(30)[["feature", "coefficient"]])
+
+    except Exception as e:
+        print("\nImpossibile estrarre i coefficienti del modello:", e)
+        coef_df = pd.DataFrame(columns=["feature", "coefficient", "abs_coefficient"])
+
+    # ========================================================
+    # SCORING SU TUTTO IL DATASET
+    # ========================================================
+
+    df_scored = df.copy()
+    df_scored["prob_tappeto_1"] = clf.predict_proba(X)[:, 1]
+    df_scored["pred_tappeto"] = clf.predict(X)
+
+    top_clients = df_scored.sort_values("prob_tappeto_1", ascending=False).copy()
+
+    # ========================================================
+    # SALVATAGGI
+    # ========================================================
+
+    numeric_profile_df.to_excel(os.path.join(OUTPUT_DIR, "profilo_numerico_tappeto.xlsx"), index=False)
+    categorical_profile_df.to_excel(os.path.join(OUTPUT_DIR, "profilo_categorico_tappeto.xlsx"), index=False)
+    mi_df.to_excel(os.path.join(OUTPUT_DIR, "mutual_info_tappeto.xlsx"), index=False)
+    coef_df.to_excel(os.path.join(OUTPUT_DIR, "feature_importance_modello.xlsx"), index=False)
+    df_scored.to_excel(os.path.join(OUTPUT_DIR, "dataset_scored_tappeto.xlsx"), index=False)
+    top_clients.to_excel(os.path.join(OUTPUT_DIR, "top_clienti_prob_tappeto.xlsx"), index=False)
+
+    # report unico excel
+    with pd.ExcelWriter(os.path.join(OUTPUT_DIR, "report_cluster_tappeto.xlsx"), engine="openpyxl") as writer:
+        numeric_profile_df.to_excel(writer, sheet_name="profilo_numerico", index=False)
+        categorical_profile_df.to_excel(writer, sheet_name="profilo_categorico", index=False)
+        mi_df.to_excel(writer, sheet_name="mutual_info", index=False)
+        coef_df.to_excel(writer, sheet_name="feature_model", index=False)
+        df_scored.to_excel(writer, sheet_name="dataset_scored", index=False)
+        top_clients.head(500).to_excel(writer, sheet_name="top_500_clienti", index=False)
+
+    # salva modello
+    model_bundle = {
+        "pipeline": clf,
+        "feature_columns": list(X.columns),
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+        "target_col": TARGET_COL,
+        "id_col": ID_COL
+    }
+
+    model_path = os.path.join(OUTPUT_DIR, "modello_cluster_tappeto.joblib")
+    joblib.dump(model_bundle, model_path)
+
+    print("\n" + "=" * 80)
+    print("FILE SALVATI")
+    print("=" * 80)
+    print(f"Cartella output: {OUTPUT_DIR}")
+    print(f"Modello salvato: {model_path}")
 
 # ============================================================
-# TARGET TAPPETO
+# FUNZIONE PER RIUSARE IL MODELLO SU UNA NUOVA LISTA NDG
 # ============================================================
 
-def is_tappeto(val):
-    if pd.isna(val):
-        return False
+def applica_modello_a_nuovo_file(model_path, new_file_path, output_file_path, sheet_name=0):
+    """
+    Carica un modello già salvato e lo applica a un nuovo file.
+    Produce score/probabilità per tappeto=1.
+    """
+    bundle = joblib.load(model_path)
+    clf = bundle["pipeline"]
+    feature_columns = bundle["feature_columns"]
 
-    s = str(val).strip().lower()
+    ext = os.path.splitext(new_file_path)[1].lower()
+    if ext in [".xlsx", ".xlsm", ".xls"]:
+        new_df = pd.read_excel(new_file_path, sheet_name=sheet_name)
+    elif ext == ".csv":
+        new_df = pd.read_csv(new_file_path)
+    else:
+        raise ValueError(f"Formato file non supportato: {ext}")
 
-    # robusto: intercetta qualsiasi cluster che contenga "tappeto"
-    return "tappeto" in s
+    # allinea colonne
+    for col in feature_columns:
+        if col not in new_df.columns:
+            new_df[col] = np.nan
 
-# ============================================================
-# CLUSTER CHANGES
-# numero cambi di cluster lungo i mesi (transizioni), non solo nunique-1
-# ============================================================
+    X_new = new_df[feature_columns].copy()
 
-def compute_cluster_changes(group, col_period, col_cluster):
-    g = group[[col_period, col_cluster]].copy()
-    g = g.dropna(subset=[col_period])
+    # conversione soft dei possibili numerici
+    for col in X_new.columns:
+        if X_new[col].dtype == "object":
+            tmp = pd.to_numeric(X_new[col].astype(str).str.replace(",", "."), errors="coerce")
+            if tmp.notna().mean() >= 0.70:
+                X_new[col] = tmp
 
-    if g.empty:
-        return 0
+    new_df["prob_tappeto_1"] = clf.predict_proba(X_new)[:, 1]
+    new_df["pred_tappeto"] = clf.predict(X_new)
 
-    # se nello stesso mese ci sono più righe, tengo una sequenza mensile pulita
-    g = g.sort_values(col_period)
-    g[col_cluster] = g[col_cluster].astype(str).str.strip()
+    new_df = new_df.sort_values("prob_tappeto_1", ascending=False)
+    new_df.to_excel(output_file_path, index=False)
 
-    # una riga per mese: prendo il primo cluster osservato nel mese
-    g = g.groupby(col_period, as_index=False)[col_cluster].first()
-
-    if len(g) <= 1:
-        return 0
-
-    changes = (g[col_cluster] != g[col_cluster].shift(1)).sum() - 1
-    return int(max(changes, 0))
-
-# ============================================================
-# PROFILING
-# ============================================================
-
-def profile_categorical(df_in, col, target="tappeto_any"):
-    t = (
-        df_in.groupby(col, dropna=False)[target]
-        .agg(n="count", rate="mean")
-        .reset_index()
-    )
-    t["rate"] = (t["rate"] * 100).round(2)
-    t = t.sort_values(["rate", "n"], ascending=[False, False])
-    return t
-
-def safe_sheet_name(name, max_len=31):
-    name = re.sub(r"[:\\/?*\[\]]", "_", str(name))
-    return name[:max_len]
+    print(f"\nNuovo scoring completato. File salvato in: {output_file_path}")
+    return new_df
 
 # ============================================================
-# MAIN
+# ESEMPIO DI RIUTILIZZO MODELLO
 # ============================================================
-
-def main():
-    h1("SCORING + PROFILAZIONE CLIENTI TAPPETO")
-
-    # ========================================================
-    # 1) LETTURA
-    # ========================================================
-    h2("1. Lettura file")
-
-    df = pd.read_excel(CONFIG["path_xlsx"], sheet_name=CONFIG["sheet_name"])
-    df = normalize_columns(df)
-
-    print("Shape iniziale:", df.shape)
-    print("Colonne disponibili:")
-    print(df.columns.tolist())
-
-    # risoluzione robusta nomi colonna
-    col_ndg = resolve_column(df, CONFIG["col_ndg"])
-    col_month = resolve_column(df, CONFIG["col_month"])
-    col_cluster = resolve_column(df, CONFIG["col_cluster"])
-
-    print("\nColonne usate:")
-    print("NDG    ->", col_ndg)
-    print("MESE   ->", col_month)
-    print("CLUSTER->", col_cluster)
-
-    # ========================================================
-    # 2) PREP
-    # ========================================================
-    h2("2. Preparazione dati")
-
-    work = df.copy()
-
-    work[col_ndg] = work[col_ndg].astype(str).str.strip()
-    work[col_cluster] = work[col_cluster].astype(str).str.strip()
-
-    work["MESE_PARSED"] = work[col_month].apply(parse_month_to_period)
-    work["is_tappeto"] = work[col_cluster].apply(is_tappeto)
-
-    print("Righe totali:", len(work))
-    print("NDG non null:", work[col_ndg].notna().sum())
-    print("MESE_PARSED validi:", work["MESE_PARSED"].notna().sum())
-    print("Righe tappeto:", int(work["is_tappeto"].sum()))
-
-    h3("Distribuzione cluster")
-    display(work[col_cluster].value_counts(dropna=False).rename_axis("Cluster").reset_index(name="n").head(20))
-
-    h3("Righe tappeto")
-    display(work["is_tappeto"].value_counts(dropna=False).rename_axis("is_tappeto").reset_index(name="n"))
-
-    # ========================================================
-    # 3) AGGREGAZIONE COERENTE A LIVELLO NDG
-    # ========================================================
-    h2("3. Aggregazione NDG-level")
-
-    def build_ndg_features(g):
-        mesi_validi = g["MESE_PARSED"].dropna().unique()
-        n_months = len(mesi_validi)
-
-        mesi_tappeto = g.loc[g["is_tappeto"], "MESE_PARSED"].dropna().unique()
-        n_months_tappeto = len(mesi_tappeto)
-
-        tappeto_any = int(n_months_tappeto >= 1)
-        tappeto_recur_ge2 = int(n_months_tappeto >= 2)
-
-        cluster_changes = compute_cluster_changes(
-            group=g,
-            col_period="MESE_PARSED",
-            col_cluster=col_cluster
-        )
-
-        return pd.Series({
-            "n_months": n_months,
-            "n_months_tappeto": n_months_tappeto,
-            "tappeto_any": tappeto_any,
-            "tappeto_recur_ge2": tappeto_recur_ge2,
-            "cluster_changes": cluster_changes
-        })
-
-    scored = work.groupby(col_ndg, dropna=False).apply(build_ndg_features).reset_index()
-    scored = scored.rename(columns={col_ndg: "ndg"})
-
-    # score semplice, leggibile e interpretabile
-    # prevale la ricorrenza tappeto, poi numero mesi tappeto, poi stabilità/cambi cluster
-    scored["score"] = (
-        0.55 * scored["tappeto_any"] +
-        0.25 * scored["tappeto_recur_ge2"] +
-        0.15 * np.where(scored["n_months"] > 0,
-                        scored["n_months_tappeto"] / scored["n_months"],
-                        0) +
-        0.05 * np.clip(scored["cluster_changes"], 0, 5) / 5
-    )
-
-    scored["score"] = scored["score"].round(6)
-
-    # ordinamento
-    scored = scored.sort_values(
-        ["score", "n_months_tappeto", "tappeto_recur_ge2", "cluster_changes"],
-        ascending=[False, False, False, False]
-    ).reset_index(drop=True)
-
-    print("Shape scored:", scored.shape)
-
-    h3("Controllo coerenza")
-    incoerenti = scored[scored["n_months_tappeto"] > scored["n_months"]]
-    print("Righe incoerenti (n_months_tappeto > n_months):", len(incoerenti))
-
-    h3("Top clienti")
-    show(scored, 20)
-
-    # ========================================================
-    # 4) PROFILO SU DATASET AGGREGATO
-    # ========================================================
-    h2("4. Profilazione base sul dataset aggregato")
-
-    num_cols_scored = [
-        "n_months",
-        "n_months_tappeto",
-        "tappeto_recur_ge2",
-        "cluster_changes",
-        "score"
-    ]
-
-    profile_num_scored = (
-        scored.groupby("tappeto_any")[num_cols_scored]
-        .agg(["count", "mean", "median", "min", "max"])
-        .round(3)
-    )
-
-    summary_scored = pd.DataFrame({
-        "n_clienti": scored.groupby("tappeto_any").size(),
-        "n_months_media": scored.groupby("tappeto_any")["n_months"].mean(),
-        "n_months_tappeto_media": scored.groupby("tappeto_any")["n_months_tappeto"].mean(),
-        "cluster_changes_media": scored.groupby("tappeto_any")["cluster_changes"].mean(),
-        "score_medio": scored.groupby("tappeto_any")["score"].mean(),
-        "score_mediano": scored.groupby("tappeto_any")["score"].median(),
-    }).round(3)
-
-    h3("Summary scored")
-    display(summary_scored)
-
-    h3("Profilo numerico scored")
-    display(profile_num_scored)
-
-    # ========================================================
-    # 5) PROFILAZIONE SU DATASET ORIGINALE
-    # ========================================================
-    h2("5. Profilazione sul dataset originale")
-
-    df_prof = work.merge(
-        scored[["ndg", "tappeto_any", "tappeto_recur_ge2", "score"]],
-        left_on=col_ndg,
-        right_on="ndg",
-        how="left"
-    )
-
-    print("Shape df_prof:", df_prof.shape)
-
-    # categoriche esistenti davvero nel df
-    cat_cols = []
-    for c in CONFIG["profile_categorical_cols"]:
-        if c in df_prof.columns:
-            cat_cols.append(c)
-        else:
-            # provo match robusto
-            try:
-                real_c = resolve_column(df_prof, c)
-                cat_cols.append(real_c)
-            except:
-                pass
-
-    # numeriche esistenti davvero nel df
-    num_cols_orig = []
-    for c in CONFIG["profile_numeric_cols"]:
-        if c in df_prof.columns:
-            num_cols_orig.append(c)
-        else:
-            try:
-                real_c = resolve_column(df_prof, c)
-                num_cols_orig.append(real_c)
-            except:
-                pass
-
-    cat_profiles = {}
-    for col in cat_cols:
-        try:
-            cat_profiles[col] = profile_categorical(df_prof, col, target="tappeto_any")
-        except Exception as e:
-            print(f"Profilazione categorica fallita per {col}: {e}")
-
-    profile_num_orig = None
-    if len(num_cols_orig) > 0:
-        try:
-            profile_num_orig = (
-                df_prof.groupby("tappeto_any")[num_cols_orig]
-                .agg(["mean", "median", "std", "min", "max"])
-                .round(3)
-            )
-        except Exception as e:
-            print("Profilazione numerica originale fallita:", e)
-
-    # tabella utile: distribuzione mesi tappeto
-    dist_mesi_tappeto = (
-        scored["n_months_tappeto"]
-        .value_counts(dropna=False)
-        .sort_index()
-        .rename_axis("n_months_tappeto")
-        .reset_index(name="n_clienti")
-    )
-
-    # tabella utile: top score
-    top_score = scored.head(100).copy()
-
-    # ========================================================
-    # 6) SALVATAGGIO EXCEL
-    # ========================================================
-    h2("6. Salvataggio output")
-
-    # file scoring
-    scored.to_excel(CONFIG["output_scored"], index=False)
-    print(f"File salvato: {CONFIG['output_scored']}")
-
-    # file profiling multi-sheet
-    with pd.ExcelWriter(CONFIG["output_profile"], engine="openpyxl") as writer:
-        summary_scored.to_excel(writer, sheet_name="summary_scored")
-        profile_num_scored.to_excel(writer, sheet_name="profile_num_scored")
-        dist_mesi_tappeto.to_excel(writer, sheet_name="dist_mesi_tappeto", index=False)
-        top_score.to_excel(writer, sheet_name="top_100_score", index=False)
-
-        # campione dati aggregati
-        scored.head(5000).to_excel(writer, sheet_name="sample_scored", index=False)
-
-        # numeriche originali
-        if profile_num_orig is not None:
-            profile_num_orig.to_excel(writer, sheet_name="profile_num_original")
-
-        # categoriche originali
-        for col, tab in cat_profiles.items():
-            tab.to_excel(writer, sheet_name=safe_sheet_name(f"cat_{col}"), index=False)
-
-        # mini export del dataset prof con target, utile per analisi successive
-        export_cols = ["ndg", "tappeto_any", "tappeto_recur_ge2", "score", "MESE_PARSED", "is_tappeto"]
-        export_cols = [c for c in export_cols if c in df_prof.columns]
-        extra_cols = [col_ndg, col_month, col_cluster]
-        extra_cols = [c for c in extra_cols if c in df_prof.columns and c not in export_cols]
-
-        df_prof_export = df_prof[extra_cols + export_cols].head(50000).copy()
-        df_prof_export.to_excel(writer, sheet_name="sample_original_with_target", index=False)
-
-    print(f"File salvato: {CONFIG['output_profile']}")
-
-    # ========================================================
-    # 7) OUTPUT NOTEBOOK
-    # ========================================================
-    h2("7. Output finali notebook")
-
-    h3("Distribuzione target tappeto_any")
-    display(scored["tappeto_any"].value_counts(dropna=False).rename_axis("tappeto_any").reset_index(name="n_clienti"))
-
-    h3("Distribuzione n_months_tappeto")
-    display(dist_mesi_tappeto)
-
-    if len(cat_profiles) > 0:
-        first_key = list(cat_profiles.keys())[0]
-        h3(f"Esempio profilo categorico: {first_key}")
-        display(cat_profiles[first_key].head(20))
-
-    if profile_num_orig is not None:
-        h3("Profilo numerico dataset originale")
-        display(profile_num_orig)
-
-    h2("Completato")
-    return scored, df_prof
-
-# ============================================================
-# RUN
-# ============================================================
-
-scored, df_prof = main()
+# Decommenta e personalizza:
+#
+# applica_modello_a_nuovo_file(
+#     model_path=os.path.join(OUTPUT_DIR, "modello_cluster_tappeto.joblib"),
+#     new_file_path=r"C:\percorso\nuova_lista_ndg.xlsx",
+#     output_file_path=os.path.join(OUTPUT_DIR, "nuova_lista_ndg_scored.xlsx"),
+#     sheet_name=0
+# )
