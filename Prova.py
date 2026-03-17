@@ -1,8 +1,3 @@
-# ============================================================
-# CLUSTER TAPPETO - VERSIONE UNICA COMPATIBILE JUPYTER
-# Analisi profilo clienti + modello salvabile + scoring futuro
-# ============================================================
-
 import os
 import warnings
 warnings.filterwarnings("ignore")
@@ -23,15 +18,15 @@ from sklearn.metrics import classification_report, confusion_matrix, roc_auc_sco
 from sklearn.feature_selection import mutual_info_classif
 
 
-# ============================================================
+# =========================================================
 # PARAMETRI UTENTE
-# ============================================================
+# =========================================================
 
-INPUT_FILE = r"dataset_clienti.xlsx"     # <--- cambia qui
-SHEET_NAME = 0                           # oppure nome foglio, es. "Sheet1"
-TARGET_COL = "tappeto"                   # <--- cambia qui se serve
-ID_COL = None                            # es. "ndg" se vuoi escluderla dalle feature
-OUTPUT_DIR = r"output_cluster_tappeto"   # <--- cartella output
+INPUT_FILE = r"C:\Users\D75737\OneDrive - BNP Paribas\Bureau\cl2.xlsx"
+SHEET_NAME = 0
+TARGET_COL = "Cluster"
+ID_COL = "ndg"
+OUTPUT_DIR = r"output_cluster_tappeto"
 
 MIN_UNIQUE_FOR_NUMERIC = 15
 TOP_N_CATEGORY_LEVELS = 15
@@ -41,9 +36,9 @@ RANDOM_STATE = 42
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ============================================================
+# =========================================================
 # FUNZIONI DI SUPPORTO
-# ============================================================
+# =========================================================
 
 def load_data(file_path, sheet_name=0):
     ext = os.path.splitext(file_path)[1].lower()
@@ -65,17 +60,16 @@ def soft_convert_numeric(series, threshold=0.70):
 
     s = series.astype(str).str.strip()
 
-    # normalizzazione leggera:
-    # - rimuove separatori migliaia semplici
-    # - converte virgola decimale in punto
+    # normalizzazione leggera
     s = s.str.replace(" ", "", regex=False)
-    s = s.str.replace(".", "", regex=False)   # toglie eventuali separatori migliaia tipo 1.234
-    s = s.str.replace(",", ".", regex=False)  # trasforma 12,5 in 12.5
+    s = s.str.replace(".", "", regex=False)   # es. 1.234 -> 1234
+    s = s.str.replace(",", ".", regex=False)  # es. 12,5 -> 12.5
 
     converted = pd.to_numeric(s, errors="coerce")
 
     if converted.notna().mean() >= threshold:
         return converted
+
     return series
 
 
@@ -98,19 +92,25 @@ def build_feature_lists(X, min_unique_for_numeric=15):
 
 def extract_model_coefficients(clf):
     """
-    Estrae i coefficienti del modello finale dalla pipeline.
+    Estrae i coefficienti del modello finale dalla pipeline,
+    usando i nomi feature reali post-preprocessing.
     """
     try:
-        feature_names = clf.named_steps["preprocessor"].get_feature_names_out()
-        coefficients = clf.named_steps["model"].coef_[0]
+        preprocessor = clf.named_steps["preprocessor"]
+        model = clf.named_steps["model"]
+
+        feature_names = preprocessor.get_feature_names_out()
+        coefficients = model.coef_[0]
 
         coef_df = pd.DataFrame({
             "feature": feature_names,
             "coefficient": coefficients
         })
+
         coef_df["abs_coefficient"] = coef_df["coefficient"].abs()
         coef_df = coef_df.sort_values("abs_coefficient", ascending=False).reset_index(drop=True)
         return coef_df
+
     except Exception as e:
         print(f"Impossibile estrarre i coefficienti del modello: {e}")
         return pd.DataFrame(columns=["feature", "coefficient", "abs_coefficient"])
@@ -119,26 +119,20 @@ def extract_model_coefficients(clf):
 def save_excel_report(path, sheets_dict):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         for sheet_name, df_sheet in sheets_dict.items():
+            if df_sheet is None:
+                continue
+            if not isinstance(df_sheet, pd.DataFrame):
+                df_sheet = pd.DataFrame(df_sheet)
             df_sheet.to_excel(writer, sheet_name=sheet_name[:31], index=False)
 
 
-def applica_modello_a_nuovo_file(model_path, new_file_path, output_file_path, sheet_name=0):
+def prepara_X_nuovo_file(new_df, bundle):
     """
-    Carica un modello già salvato e lo applica a un nuovo file.
-    Produce score/probabilità per tappeto=1.
+    Allinea il nuovo file alle feature usate in training.
     """
-    bundle = joblib.load(model_path)
-    clf = bundle["pipeline"]
     feature_columns = bundle["feature_columns"]
 
-    ext = os.path.splitext(new_file_path)[1].lower()
-    if ext in [".xlsx", ".xls", ".xlsm"]:
-        new_df = pd.read_excel(new_file_path, sheet_name=sheet_name)
-    elif ext == ".csv":
-        new_df = pd.read_csv(new_file_path)
-    else:
-        raise ValueError(f"Formato file non supportato: {ext}")
-
+    new_df = new_df.copy()
     new_df.columns = [str(c).strip() for c in new_df.columns]
 
     for col in feature_columns:
@@ -150,7 +144,32 @@ def applica_modello_a_nuovo_file(model_path, new_file_path, output_file_path, sh
     for col in X_new.columns:
         X_new[col] = soft_convert_numeric(X_new[col])
 
-    new_df["prob_tappeto_1"] = clf.predict_proba(X_new)[:, 1]
+    return X_new, new_df
+
+
+def applica_modello_a_nuovo_file(model_path, new_file_path, output_file_path, sheet_name=0):
+    """
+    Carica un modello già salvato e lo applica a un nuovo file.
+    Produce score/probabilità per tappeto=1.
+    """
+    bundle = joblib.load(model_path)
+    clf = bundle["pipeline"]
+
+    ext = os.path.splitext(new_file_path)[1].lower()
+    if ext in [".xlsx", ".xls", ".xlsm"]:
+        new_df = pd.read_excel(new_file_path, sheet_name=sheet_name)
+    elif ext == ".csv":
+        new_df = pd.read_csv(new_file_path)
+    else:
+        raise ValueError(f"Formato file non supportato: {ext}")
+
+    X_new, new_df = prepara_X_nuovo_file(new_df, bundle)
+
+    if hasattr(clf, "predict_proba"):
+        new_df["prob_tappeto_1"] = clf.predict_proba(X_new)[:, 1]
+    else:
+        new_df["prob_tappeto_1"] = np.nan
+
     new_df["pred_tappeto"] = clf.predict(X_new)
 
     new_df = new_df.sort_values("prob_tappeto_1", ascending=False).reset_index(drop=True)
@@ -162,9 +181,9 @@ def applica_modello_a_nuovo_file(model_path, new_file_path, output_file_path, sh
     return new_df
 
 
-# ============================================================
+# =========================================================
 # 1. LETTURA DATI
-# ============================================================
+# =========================================================
 
 df = load_data(INPUT_FILE, SHEET_NAME)
 df.columns = [str(c).strip() for c in df.columns]
@@ -176,9 +195,9 @@ print("Shape iniziale:", df.shape)
 display(df.head())
 
 
-# ============================================================
+# =========================================================
 # 2. CONTROLLI PRELIMINARI
-# ============================================================
+# =========================================================
 
 if TARGET_COL not in df.columns:
     raise ValueError(f"La colonna target '{TARGET_COL}' non esiste nel dataset.")
@@ -191,12 +210,17 @@ if df.empty:
     raise ValueError("Il dataset è vuoto dopo la pulizia del target.")
 
 print("\nDistribuzione target:")
-display(df[TARGET_COL].value_counts(dropna=False).rename_axis("classe").reset_index(name="conteggio"))
+display(
+    df[TARGET_COL]
+    .value_counts(dropna=False)
+    .rename_axis("classe")
+    .reset_index(name="conteggio")
+)
 
 
-# ============================================================
+# =========================================================
 # 3. COSTRUZIONE FEATURE SET
-# ============================================================
+# =========================================================
 
 exclude_cols = [TARGET_COL]
 if ID_COL is not None and ID_COL in df.columns:
@@ -211,6 +235,7 @@ y = df[TARGET_COL].copy()
 for col in X.columns:
     X[col] = soft_convert_numeric(X[col])
 
+feature_columns = X.columns.tolist()
 numeric_cols, categorical_cols = build_feature_lists(X, MIN_UNIQUE_FOR_NUMERIC)
 
 print("\nNumero feature candidate:", len(candidate_features))
@@ -224,9 +249,9 @@ print("\nPrime feature categoriche:")
 print(categorical_cols[:20])
 
 
-# ============================================================
+# =========================================================
 # 4. ANALISI DESCRITTIVA CLIENTI TAPPETO = 1
-# ============================================================
+# =========================================================
 
 df_pos = df[df[TARGET_COL] == 1].copy()
 df_neg = df[df[TARGET_COL] == 0].copy()
@@ -237,18 +262,18 @@ print("=" * 90)
 print("Numero clienti tappeto=1:", len(df_pos))
 print("Numero clienti tappeto=0:", len(df_neg))
 
-# ---------- profilo numerico
+# profilo numerico
 numeric_profile_rows = []
 
 for col in numeric_cols:
-    pos_mean = df_pos[col].mean()
-    neg_mean = df_neg[col].mean() if len(df_neg) > 0 else np.nan
-    pos_median = df_pos[col].median()
-    neg_median = df_neg[col].median() if len(df_neg) > 0 else np.nan
+    pos_mean = pd.to_numeric(df_pos[col], errors="coerce").mean()
+    neg_mean = pd.to_numeric(df_neg[col], errors="coerce").mean() if len(df_neg) > 0 else np.nan
+    pos_median = pd.to_numeric(df_pos[col], errors="coerce").median()
+    neg_median = pd.to_numeric(df_neg[col], errors="coerce").median() if len(df_neg) > 0 else np.nan
     diff_mean = pos_mean - neg_mean if pd.notna(neg_mean) else np.nan
 
     numeric_profile_rows.append({
-        "variabile": col,
+        "variable": col,
         "mean_tappeto_1": pos_mean,
         "median_tappeto_1": pos_median,
         "mean_tappeto_0": neg_mean,
@@ -266,14 +291,14 @@ if not numeric_profile_df.empty:
 else:
     print("\nNessuna variabile numerica utile trovata.")
 
-# ---------- profilo categorico
+# profilo categorico
 categorical_profile_all = []
 
 for col in categorical_cols:
     tmp = (
         df.groupby([col, TARGET_COL], dropna=False)
-          .size()
-          .reset_index(name="n")
+        .size()
+        .reset_index(name="n")
     )
 
     pivot = tmp.pivot_table(index=col, columns=TARGET_COL, values="n", fill_value=0)
@@ -309,35 +334,38 @@ else:
     print("\nNessuna variabile categorica utile trovata.")
 
 
-# ============================================================
+# =========================================================
 # 5. MUTUAL INFORMATION
-# ============================================================
+# =========================================================
 
 X_mi = X.copy()
+X_mi = X_mi.select_dtypes(exclude=["datetime64[ns]", "datetime64"])
 
 for col in X_mi.columns:
-    if X_mi[col].dtype == "object":
+    if not pd.api.types.is_numeric_dtype(X_mi[col]):
         X_mi[col] = X_mi[col].fillna("MISSING").astype(str).astype("category").cat.codes
     else:
+        X_mi[col] = pd.to_numeric(X_mi[col], errors="coerce")
         X_mi[col] = X_mi[col].fillna(X_mi[col].median())
 
 try:
     mi_scores = mutual_info_classif(X_mi, y, discrete_features="auto", random_state=RANDOM_STATE)
     mi_df = pd.DataFrame({
-        "variabile": X_mi.columns,
+        "variable": X_mi.columns,
         "mutual_info_score": mi_scores
     }).sort_values("mutual_info_score", ascending=False).reset_index(drop=True)
 
     print("\nTop variabili per Mutual Information:")
     display(mi_df.head(20))
+
 except Exception as e:
     print("\nMutual Information non calcolabile:", e)
-    mi_df = pd.DataFrame(columns=["variabile", "mutual_info_score"])
+    mi_df = pd.DataFrame(columns=["variable", "mutual_info_score"])
 
 
-# ============================================================
+# =========================================================
 # 6. MODELLO PREDITTIVO
-# ============================================================
+# =========================================================
 
 if y.nunique() < 2:
     print("\n" + "=" * 90)
@@ -397,7 +425,6 @@ else:
     print("\n" + "=" * 90)
     print("VALUTAZIONE MODELLO")
     print("=" * 90)
-
     print("\nConfusion matrix:")
     print(confusion_matrix(y_test, y_pred))
 
@@ -413,9 +440,10 @@ else:
     coef_df = extract_model_coefficients(clf)
 
     if not coef_df.empty:
-        print("\nTop feature del modello:")
-        display(coef_df[["feature", "coefficient"]].head(30))
+        print("\nTop coefficienti del modello:")
+        display(coef_df.head(20))
 
+    # scoring su tutto il dataset
     df_scored = df.copy()
     df_scored["prob_tappeto_1"] = clf.predict_proba(X)[:, 1]
     df_scored["pred_tappeto"] = clf.predict(X)
@@ -425,10 +453,24 @@ else:
     print("\nTop clienti per probabilità tappeto:")
     display(top_clients.head(20))
 
+    # salva bundle modello
+    model_bundle = {
+        "pipeline": clf,
+        "feature_columns": feature_columns,
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+        "target_col": TARGET_COL,
+        "id_col": ID_COL
+    }
 
-# ============================================================
-# 7. SALVATAGGI
-# ============================================================
+    model_path = os.path.join(OUTPUT_DIR, "modello_cluster_tappeto.joblib")
+    joblib.dump(model_bundle, model_path)
+    print(f"\nModello salvato in: {model_path}")
+
+
+# =========================================================
+# 7. SALVATAGGIO OUTPUT
+# =========================================================
 
 numeric_profile_path = os.path.join(OUTPUT_DIR, "profilo_numerico_tappeto.xlsx")
 categorical_profile_path = os.path.join(OUTPUT_DIR, "profilo_categorico_tappeto.xlsx")
@@ -437,12 +479,18 @@ coef_path = os.path.join(OUTPUT_DIR, "feature_importance_modello.xlsx")
 scored_path = os.path.join(OUTPUT_DIR, "dataset_scored_tappeto.xlsx")
 top_clients_path = os.path.join(OUTPUT_DIR, "top_clienti_prob_tappeto.xlsx")
 report_path = os.path.join(OUTPUT_DIR, "report_cluster_tappeto.xlsx")
-model_path = os.path.join(OUTPUT_DIR, "modello_cluster_tappeto.joblib")
 
-numeric_profile_df.to_excel(numeric_profile_path, index=False)
-categorical_profile_df.to_excel(categorical_profile_path, index=False)
-mi_df.to_excel(mi_path, index=False)
-coef_df.to_excel(coef_path, index=False)
+if not numeric_profile_df.empty:
+    numeric_profile_df.to_excel(numeric_profile_path, index=False)
+
+if not categorical_profile_df.empty:
+    categorical_profile_df.to_excel(categorical_profile_path, index=False)
+
+if not mi_df.empty:
+    mi_df.to_excel(mi_path, index=False)
+
+if not coef_df.empty:
+    coef_df.to_excel(coef_path, index=False)
 
 if "prob_tappeto_1" in df_scored.columns:
     df_scored.to_excel(scored_path, index=False)
@@ -455,42 +503,21 @@ save_excel_report(
         "profilo_categorico": categorical_profile_df,
         "mutual_info": mi_df,
         "feature_model": coef_df,
-        "dataset_scored": df_scored if "prob_tappeto_1" in df_scored.columns else df,
+        "dataset_scored": df_scored if "prob_tappeto_1" in df_scored.columns else df.head(500),
         "top_500_clienti": top_clients.head(500) if "prob_tappeto_1" in top_clients.columns else df.head(500)
     }
 )
 
-if y.nunique() >= 2:
-    model_bundle = {
-        "pipeline": clf,
-        "feature_columns": list(X.columns),
-        "numeric_cols": numeric_cols,
-        "categorical_cols": categorical_cols,
-        "target_col": TARGET_COL,
-        "id_col": ID_COL
-    }
-    joblib.dump(model_bundle, model_path)
-
-print("\n" + "=" * 90)
-print("FILE SALVATI")
-print("=" * 90)
-print("Cartella output:", OUTPUT_DIR)
-print("Profilo numerico:", numeric_profile_path)
-print("Profilo categorico:", categorical_profile_path)
-print("Mutual information:", mi_path)
-print("Feature importance:", coef_path)
-print("Dataset scored:", scored_path if "prob_tappeto_1" in df_scored.columns else "non generato")
-print("Top clienti:", top_clients_path if "prob_tappeto_1" in top_clients.columns else "non generato")
-print("Report Excel:", report_path)
-print("Modello salvato:", model_path if y.nunique() >= 2 else "non generato")
+print("\nOutput salvati nella cartella:", OUTPUT_DIR)
 
 
-# ============================================================
+# =========================================================
 # 8. ESEMPIO DI RIUTILIZZO SU NUOVA LISTA NDG
-# ============================================================
+# =========================================================
 
 # Decommenta queste righe quando vuoi applicare il modello a un nuovo file:
 #
+# model_path = os.path.join(OUTPUT_DIR, "modello_cluster_tappeto.joblib")
 # applica_modello_a_nuovo_file(
 #     model_path=model_path,
 #     new_file_path=r"nuova_lista_ndg.xlsx",
