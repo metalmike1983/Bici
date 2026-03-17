@@ -1,40 +1,74 @@
-import os
-import warnings
-warnings.filterwarnings("ignore")
+def extract_model_coefficients(clf, numeric_cols=None, categorical_cols=None):
+    """
+    Estrae i coefficienti del modello finale dalla pipeline.
+    Compatibile anche con versioni sklearn meno recenti.
+    """
+    try:
+        preprocessor = clf.named_steps["preprocessor"]
+        model = clf.named_steps["model"]
 
-import numpy as np
-import pandas as pd
-import joblib
+        coefficients = model.coef_[0]
 
-from IPython.display import display
+        feature_names = []
 
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-from sklearn.feature_selection import mutual_info_classif
+        # scorri i transformer del ColumnTransformer
+        for name, transformer, cols in preprocessor.transformers_:
+            if name == "remainder" and transformer == "drop":
+                continue
 
+            if isinstance(cols, slice):
+                cols = list(range(len(cols)))
 
-# =========================================================
-# PARAMETRI UTENTE
-# =========================================================
+            # Pipeline numerica
+            if name == "num":
+                feature_names.extend(cols)
 
-INPUT_FILE = r"C:\Users\D75737\OneDrive - BNP Paribas\Bureau\cl2.xlsx"
-SHEET_NAME = 0
-TARGET_COL = "Cluster"
-ID_COL = "ndg"
-OUTPUT_DIR = r"output_cluster_tappeto"
+            # Pipeline categorica
+            elif name == "cat":
+                # se è una pipeline, prendo il onehot
+                if hasattr(transformer, "named_steps"):
+                    onehot = transformer.named_steps.get("onehot", None)
+                else:
+                    onehot = None
 
-MIN_UNIQUE_FOR_NUMERIC = 15
-TOP_N_CATEGORY_LEVELS = 15
-TEST_SIZE = 0.30
-RANDOM_STATE = 42
+                if onehot is not None:
+                    # sklearn vecchio
+                    if hasattr(onehot, "get_feature_names"):
+                        cat_names = onehot.get_feature_names(cols)
+                    # sklearn nuovo
+                    elif hasattr(onehot, "get_feature_names_out"):
+                        cat_names = onehot.get_feature_names_out(cols)
+                    else:
+                        cat_names = cols
+                    feature_names.extend(cat_names)
+                else:
+                    feature_names.extend(cols)
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+            else:
+                feature_names.extend(cols)
 
+        # sicurezza: se le lunghezze non coincidono, tronca alla minima
+        if len(feature_names) != len(coefficients):
+            min_len = min(len(feature_names), len(coefficients))
+            print(
+                f"Attenzione: feature_names={len(feature_names)}, coefficients={len(coefficients)}. "
+                f"Allineo alla lunghezza minima={min_len}."
+            )
+            feature_names = list(feature_names)[:min_len]
+            coefficients = coefficients[:min_len]
+
+        coef_df = pd.DataFrame({
+            "feature": feature_names,
+            "coefficient": coefficients
+        })
+
+        coef_df["abs_coefficient"] = coef_df["coefficient"].abs()
+        coef_df = coef_df.sort_values("abs_coefficient", ascending=False).reset_index(drop=True)
+        return coef_df
+
+    except Exception as e:
+        print(f"Impossibile estrarre i coefficienti del modello: {e}")
+        return pd.DataFrame(columns=["feature", "coefficient", "abs_coefficient"])
 
 # =========================================================
 # FUNZIONI DI SUPPORTO
