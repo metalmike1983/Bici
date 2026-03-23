@@ -161,8 +161,36 @@ def extract_model_coefficients(clf):
         preprocessor = clf.named_steps["preprocessor"]
         model = clf.named_steps["model"]
 
-        feature_names = preprocessor.get_feature_names_out()
-        coefficients = model.coef_[0]
+        coefficients = model.coef_.ravel()
+
+        # Provo prima il recupero diretto
+        try:
+            feature_names = preprocessor.get_feature_names_out()
+        except Exception:
+            # Fallback manuale robusto
+            feature_names = []
+
+            for name, transformer, cols in preprocessor.transformers_:
+                if transformer == "drop":
+                    continue
+
+                if name == "num":
+                    feature_names.extend(list(cols))
+
+                elif name == "cat":
+                    # categorical_transformer è una Pipeline con step "onehot"
+                    ohe = transformer.named_steps["onehot"]
+                    cat_feature_names = ohe.get_feature_names_out(cols)
+                    feature_names.extend(list(cat_feature_names))
+
+                else:
+                    feature_names.extend(list(cols))
+
+        if len(feature_names) != len(coefficients):
+            raise ValueError(
+                f"Mismatch tra feature names ({len(feature_names)}) "
+                f"e coefficienti ({len(coefficients)})"
+            )
 
         coef_df = pd.DataFrame({
             "feature": feature_names,
@@ -171,6 +199,7 @@ def extract_model_coefficients(clf):
         }).sort_values("abs_coefficient", ascending=False)
 
         return coef_df
+
     except Exception as e:
         print("Impossibile estrarre i coefficienti:", e)
         return pd.DataFrame()
@@ -357,7 +386,6 @@ print(f"Quota MONITORARE      : {SHARE_MONITORARE:.0%}")
 print(f"Soglia NON_TOCCARE    : {threshold_non_toccare:.6f}")
 print(f"Soglia MONITORARE     : {threshold_monitorare:.6f}")
 
-# valutazione binaria con la soglia monitorare
 print("\n")
 evaluate_binary_cut(y_test, y_proba_test, threshold_monitorare)
 
@@ -400,9 +428,21 @@ coef_df = extract_model_coefficients(clf)
 
 if not coef_df.empty:
     print("=" * 90)
-    print("TOP COEFFICIENTI MODELLO")
+    print("TOP COEFFICIENTI MODELLO - ASSOLUTI")
     print("=" * 90)
     display(coef_df.head(30))
+
+    print("=" * 90)
+    print("TOP COEFFICIENTI POSITIVI")
+    print("=" * 90)
+    display(coef_df.sort_values("coefficient", ascending=False).head(20))
+
+    print("=" * 90)
+    print("TOP COEFFICIENTI NEGATIVI")
+    print("=" * 90)
+    display(coef_df.sort_values("coefficient", ascending=True).head(20))
+else:
+    print("Nessun coefficiente estratto.")
 
 
 # =========================================================
@@ -465,6 +505,11 @@ display(df_scored.head(20))
 output_scored_path = os.path.join(OUTPUT_DIR, "dataset_scored_operativo_v2.xlsx")
 df_scored.to_excel(output_scored_path, index=False)
 
+# salvo anche i coefficienti, se disponibili
+coef_output_path = os.path.join(OUTPUT_DIR, "coefficienti_modello_v2.xlsx")
+if not coef_df.empty:
+    coef_df.to_excel(coef_output_path, index=False)
+
 model_bundle = {
     "pipeline": clf,
     "feature_columns": feature_columns,
@@ -488,4 +533,6 @@ print("=" * 90)
 print("SALVATAGGIO COMPLETATO")
 print("=" * 90)
 print("Output scoring:", output_scored_path)
+if not coef_df.empty:
+    print("Output coefficienti:", coef_output_path)
 print("Modello:", model_path)
