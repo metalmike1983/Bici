@@ -1,7 +1,12 @@
 # =========================================================
-# 0. IMPORT
+# MODELLO V2 - CLUSTER TAPPETO OPERATIVO
+# Versione corretta con feature engineering su recidivita'
 # =========================================================
+
 import os
+import warnings
+warnings.filterwarnings("ignore")
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -18,9 +23,6 @@ from sklearn.metrics import (
     roc_auc_score
 )
 
-from IPython.display import display
-
-
 # =========================================================
 # 1. CONFIG
 # =========================================================
@@ -29,510 +31,498 @@ SHEET_NAME = 0
 OUTPUT_DIR = r"C:\Users\mike_\OneDrive - BNP Paribas\Bureau\PITONE\output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-TARGET_COL = "target"   # <-- cambia se serve
-ID_COL = "ndg"          # <-- cambia se serve
+TARGET_COL = "target"      # <-- cambia se serve
+ID_COL = "ndg"             # <-- cambia se serve
 RANDOM_STATE = 42
 TEST_SIZE = 0.30
 
-# quote portafoglio per fasce operative
-# esempio:
-# top 20% = NON_TOCCARE_ORA
-# successivo 30% = MONITORARE
-# resto = INTERVENIRE_PRIMA
-SHARE_NON_TOCCARE = 0.20
-SHARE_MONITORARE = 0.30
+MODEL_NAME = "modello_cluster_tappeto_operativo_v2.joblib"
+SCORED_FILE = "scoring_v2.xlsx"
+COEF_FILE = "coefficienti_v2.xlsx"
 
-# se hai sentinelle tipo 9999 da trattare come missing
-REPLACE_9999_WITH_NAN = True
-
+# soglie operative iniziali
+THRESH_NON_TOCCARE = 0.15
+THRESH_MONITORARE = 0.45
 
 # =========================================================
-# 2. FUNZIONI BASE
+# 2. LETTURA DATI
 # =========================================================
-def load_data(input_file, sheet_name=0):
-    ext = os.path.splitext(input_file)[1].lower()
-    if ext in [".xlsx", ".xls", ".xlsm"]:
-        return pd.read_excel(input_file, sheet_name=sheet_name)
-    elif ext == ".csv":
-        return pd.read_csv(input_file)
-    else:
-        raise ValueError(f"Formato file non supportato: {ext}")
+df = pd.read_excel(INPUT_FILE, sheet_name=SHEET_NAME)
+print(f"Dataset letto: {df.shape[0]} righe, {df.shape[1]} colonne")
 
+# uniforma nomi colonne
+df.columns = [str(c).strip() for c in df.columns]
 
-def clean_columns(df):
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Colonna target '{TARGET_COL}' non trovata nel dataset.")
+
+if ID_COL not in df.columns:
+    print(f"ATTENZIONE: colonna ID '{ID_COL}' non trovata. Procedo senza ID dedicato.")
+    df[ID_COL] = np.arange(len(df))
+
+# =========================================================
+# 3. FEATURE ENGINEERING V2
+# =========================================================
+# Qui costruisco feature che correggono il bias su RECIDIVITA_RT
+
+def add_feature_if_exists(df, new_col, condition, true_value=1, false_value=0):
+    df[new_col] = np.where(condition, true_value, false_value)
     return df
 
+# -----------------------------
+# 3.1 Normalizzazione RECIDIVITA
+# -----------------------------
+if "RECIDIVITA" in df.columns:
+    df["RECIDIVITA"] = df["RECIDIVITA"].astype(str).str.strip().str.upper()
+else:
+    df["RECIDIVITA"] = "MISSING"
 
-def clean_target(df, target_col):
-    df = df.copy()
+# -----------------------------
+# 3.2 Proxy di rientro / miglioramento
+# -----------------------------
+# Usiamo colonne viste nei tuoi screenshot.
+# Se alcune non esistono, le inizializziamo a NaN.
+proxy_cols = [
+    "CC_TREND_SALDO_3_1",
+    "CC_TREND_DELTA_AVERE_DARE_3_1",
+    "CC_IMP_DELTA_AVERE_DARE_AVG",
+    "MEDIA_SALDO",
+    "CC_NUM_STIPEND",
+    "CC_IMP_STIPEND",
+    "MEDIA_NUM_STIPE",
+    "F_IMP_RATA_MENS_TOT",
+    "F_IMP_UTILZ_TOT",
+    "IND_VR_SALDO_CC_UM_SCONF",
+    "R_PD_UM"
+]
 
-    if target_col not in df.columns:
-        raise ValueError(f"La colonna target '{target_col}' non esiste nel dataset.")
+for c in proxy_cols:
+    if c not in df.columns:
+        df[c] = np.nan
 
-    df["_target_raw_backup_"] = df[target_col]
-    df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+# coercizione numerica prudente
+for c in proxy_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    print("=" * 90)
-    print("PULIZIA TARGET")
-    print("=" * 90)
-    print("Righe iniziali:", len(df))
-    print("Target mancanti/non validi:", df[target_col].isna().sum())
+# -----------------------------
+# 3.3 Flag stipendio
+# -----------------------------
+df["HAS_STIPENDIO"] = (
+    (df["CC_NUM_STIPEND"].fillna(0) > 0) |
+    (df["MEDIA_NUM_STIPE"].fillna(0) > 0) |
+    (df["CC_IMP_STIPEND"].fillna(0) > 0)
+).astype(int)
 
-    df = df[df[target_col].notna()].copy()
-    df[target_col] = df[target_col].astype(int)
+# -----------------------------
+# 3.4 Trend positivi / negativi
+# -----------------------------
+df["TREND_SALDO_POS"] = (df["CC_TREND_SALDO_3_1"].fillna(0) > 0).astype(int)
+df["TREND_DELTA_POS"] = (df["CC_TREND_DELTA_AVERE_DARE_3_1"].fillna(0) > 0).astype(int)
+df["DELTA_AVERE_DARE_POS"] = (df["CC_IMP_DELTA_AVERE_DARE_AVG"].fillna(0) > 0).astype(int)
 
-    if df.empty:
-        raise ValueError("Il dataset è vuoto dopo la pulizia del target.")
+# -----------------------------
+# 3.5 Score di rientro proxy
+# -----------------------------
+# Pesi semplici e interpretabili
+df["SCORE_RIENTRO_PROXY"] = (
+    0.40 * df["CC_TREND_SALDO_3_1"].fillna(0) +
+    0.35 * df["CC_TREND_DELTA_AVERE_DARE_3_1"].fillna(0) +
+    0.25 * np.sign(df["CC_IMP_DELTA_AVERE_DARE_AVG"].fillna(0))
+)
 
-    print("Righe finali dopo pulizia:", len(df))
-    print("\nDistribuzione target:")
-    display(
-        df[target_col]
-        .value_counts(dropna=False)
-        .rename_axis("classe")
-        .reset_index(name="conteggio")
+# -----------------------------
+# 3.6 Intensita' utilizzo / pressione
+# -----------------------------
+# utile per distinguere recidivo tecnico vs stress finanziario
+df["PRESSIONE_FINANZIARIA_PROXY"] = (
+    df["F_IMP_UTILZ_TOT"].fillna(0) +
+    df["F_IMP_RATA_MENS_TOT"].fillna(0) +
+    np.abs(df["IND_VR_SALDO_CC_UM_SCONF"].fillna(0))
+)
+
+# -----------------------------
+# 3.7 Rischio alto da PD
+# -----------------------------
+df["PD_ALTA"] = (df["R_PD_UM"].fillna(0) >= 0.05).astype(int)
+
+# -----------------------------
+# 3.8 RT “buono” e RT “cattivo”
+# -----------------------------
+df["IS_RT"] = (df["RECIDIVITA"] == "RT").astype(int)
+df["IS_NR"] = (df["RECIDIVITA"] == "NR").astype(int)
+
+df["RT_BUONO"] = (
+    (df["RECIDIVITA"] == "RT") &
+    (df["SCORE_RIENTRO_PROXY"] > 0) &
+    (df["HAS_STIPENDIO"] == 1) &
+    (df["PD_ALTA"] == 0)
+).astype(int)
+
+df["RT_CATTIVO"] = (
+    (df["RECIDIVITA"] == "RT") &
+    (
+        (df["SCORE_RIENTRO_PROXY"] <= 0) |
+        (df["PD_ALTA"] == 1)
     )
+).astype(int)
 
-    return df
+# -----------------------------
+# 3.9 Cliente protetto da flussi
+# -----------------------------
+df["FLUSSI_PROTETTIVI"] = (
+    (df["HAS_STIPENDIO"] == 1) &
+    (df["TREND_SALDO_POS"] == 1)
+).astype(int)
 
+# -----------------------------
+# 3.10 Squilibrio operativo
+# -----------------------------
+df["SQUILIBRIO_OPERATIVO"] = (
+    (df["HAS_STIPENDIO"] == 0) &
+    (df["TREND_SALDO_POS"] == 0) &
+    (df["TREND_DELTA_POS"] == 0)
+).astype(int)
 
-def build_feature_lists(df, target_col, id_col=None):
-    exclude_cols = [target_col, "_target_raw_backup_"]
-    if id_col is not None and id_col in df.columns:
-        exclude_cols.append(id_col)
+# =========================================================
+# 4. PULIZIA COLONNE NON USABILI
+# =========================================================
+drop_cols = [TARGET_COL]
 
-    feature_columns = [c for c in df.columns if c not in exclude_cols]
+# evita leakage su output/cluster se gia' presenti
+possible_leakage = [
+    "Cluster",
+    "cluster",
+    "classe_operativa",
+    "RISCHIO",
+    "new_priority",
+    "max_pred1",
+    "prob",
+    "prediction",
+    "pred",
+    "score_model",
+    "score"
+]
 
-    X = df[feature_columns].copy()
-    y = df[target_col].copy()
+for c in possible_leakage:
+    if c in df.columns and c not in drop_cols:
+        drop_cols.append(c)
 
-    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = [c for c in X.columns if c not in numeric_cols]
+X = df.drop(columns=drop_cols, errors="ignore").copy()
+y = df[TARGET_COL].copy()
 
-    return X, y, feature_columns, numeric_cols, categorical_cols
+# Rimuovo ID dalla modellazione ma lo tengo da parte
+id_series = X[ID_COL].copy() if ID_COL in X.columns else pd.Series(np.arange(len(X)), name=ID_COL)
+X = X.drop(columns=[ID_COL], errors="ignore")
 
+# =========================================================
+# 5. IDENTIFICAZIONE FEATURE NUMERICHE / CATEGORICHE
+# =========================================================
+numeric_cols = X.select_dtypes(include=[np.number, "int64", "float64", "int32", "float32"]).columns.tolist()
+categorical_cols = [c for c in X.columns if c not in numeric_cols]
 
-def replace_sentinel_values(df, numeric_cols, sentinel=9999):
-    df = df.copy()
-    for c in numeric_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-        df[c] = df[c].replace(sentinel, np.nan)
-    return df
+print("\nNumero feature numeriche:", len(numeric_cols))
+print("Numero feature categoriche:", len(categorical_cols))
 
+# =========================================================
+# 6. TRAIN / TEST SPLIT
+# =========================================================
+X_train, X_test, y_train, y_test, id_train, id_test = train_test_split(
+    X, y, id_series,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=y if y.nunique() > 1 else None
+)
 
-def build_pipeline(numeric_cols, categorical_cols):
-    numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
+# =========================================================
+# 7. PREPROCESSING
+# =========================================================
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
 
-    categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore"))
-    ])
+# compatibilita' sklearn nuova/vecchia
+try:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+except TypeError:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, numeric_cols),
-            ("cat", categorical_transformer, categorical_cols)
-        ],
-        remainder="drop"
-    )
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", ohe)
+])
 
-    model = LogisticRegression(
-        max_iter=4000,
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_cols),
+        ("cat", categorical_transformer, categorical_cols)
+    ],
+    remainder="drop"
+)
+
+# =========================================================
+# 8. MODELLO
+# =========================================================
+model = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("clf", LogisticRegression(
+        max_iter=3000,
         class_weight="balanced",
         solver="liblinear",
         random_state=RANDOM_STATE
-    )
+    ))
+])
 
-    clf = Pipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("model", model)
-    ])
+# =========================================================
+# 9. TRAIN
+# =========================================================
+model.fit(X_train, y_train)
 
-    return clf
+# =========================================================
+# 10. VALUTAZIONE TEST
+# =========================================================
+y_pred = model.predict(X_test)
+y_prob = model.predict_proba(X_test)[:, 1]
 
+print("\n" + "=" * 90)
+print("VALUTAZIONE TEST SET")
+print("=" * 90)
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
 
-def extract_model_coefficients(clf):
-    try:
-        preprocessor = clf.named_steps["preprocessor"]
-        model = clf.named_steps["model"]
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, digits=4))
 
-        coefficients = model.coef_.ravel()
+try:
+    auc = roc_auc_score(y_test, y_prob)
+    print(f"\nROC AUC: {auc:.6f}")
+except Exception as e:
+    print(f"\nROC AUC non calcolabile: {e}")
 
-        # Provo prima il recupero diretto
-        try:
-            feature_names = preprocessor.get_feature_names_out()
-        except Exception:
-            # Fallback manuale robusto
-            feature_names = []
+# =========================================================
+# 11. CLASSI OPERATIVE
+# =========================================================
+# V2: la decisione usa probabilita' + correzione business su RT_BUONO
 
-            for name, transformer, cols in preprocessor.transformers_:
-                if transformer == "drop":
-                    continue
-
-                if name == "num":
-                    feature_names.extend(list(cols))
-
-                elif name == "cat":
-                    # categorical_transformer è una Pipeline con step "onehot"
-                    ohe = transformer.named_steps["onehot"]
-                    cat_feature_names = ohe.get_feature_names_out(cols)
-                    feature_names.extend(list(cat_feature_names))
-
-                else:
-                    feature_names.extend(list(cols))
-
-        if len(feature_names) != len(coefficients):
-            raise ValueError(
-                f"Mismatch tra feature names ({len(feature_names)}) "
-                f"e coefficienti ({len(coefficients)})"
-            )
-
-        coef_df = pd.DataFrame({
-            "feature": feature_names,
-            "coefficient": coefficients,
-            "abs_coefficient": np.abs(coefficients)
-        }).sort_values("abs_coefficient", ascending=False)
-
-        return coef_df
-
-    except Exception as e:
-        print("Impossibile estrarre i coefficienti:", e)
-        return pd.DataFrame()
-
-
-def compute_dynamic_thresholds(prob_series, share_non_toccare=0.20, share_monitorare=0.30):
-    """
-    Calcola soglie automatiche in base alle quote di portafoglio.
-    """
-    if share_non_toccare <= 0 or share_non_toccare >= 1:
-        raise ValueError("share_non_toccare deve essere compreso tra 0 e 1")
-
-    if share_monitorare < 0 or share_monitorare >= 1:
-        raise ValueError("share_monitorare deve essere compreso tra 0 e 1")
-
-    if share_non_toccare + share_monitorare >= 1:
-        raise ValueError("share_non_toccare + share_monitorare deve essere < 1")
-
-    threshold_non_toccare = prob_series.quantile(1 - share_non_toccare)
-    threshold_monitorare = prob_series.quantile(1 - (share_non_toccare + share_monitorare))
-
-    return float(threshold_non_toccare), float(threshold_monitorare)
-
-
-def assign_operational_band(prob, threshold_non_toccare, threshold_monitorare):
-    if prob >= threshold_non_toccare:
+def assegna_classe_operativa(prob, rt_buono, pd_alta, flussi_protettivi):
+    # override protettivo per recidivi tecnici "buoni"
+    if rt_buono == 1 and pd_alta == 0 and flussi_protettivi == 1 and prob < 0.50:
         return "NON_TOCCARE_ORA"
-    elif prob >= threshold_monitorare:
+
+    if prob < THRESH_NON_TOCCARE:
+        return "NON_TOCCARE_ORA"
+    elif prob < THRESH_MONITORARE:
         return "MONITORARE"
     else:
         return "INTERVENIRE_PRIMA"
 
+# test scored
+test_scored = X_test.copy()
+test_scored[ID_COL] = id_test.values
+test_scored[TARGET_COL] = y_test.values
+test_scored["prob_rischio"] = y_prob
+test_scored["predizione_binaria"] = y_pred
 
-def add_operational_columns(df, prob_col, threshold_non_toccare, threshold_monitorare):
-    df = df.copy()
+# recupero feature ingegnerizzate dal dataframe originale
+engineered_cols = [
+    "RECIDIVITA",
+    "IS_RT",
+    "IS_NR",
+    "RT_BUONO",
+    "RT_CATTIVO",
+    "HAS_STIPENDIO",
+    "TREND_SALDO_POS",
+    "TREND_DELTA_POS",
+    "DELTA_AVERE_DARE_POS",
+    "SCORE_RIENTRO_PROXY",
+    "PRESSIONE_FINANZIARIA_PROXY",
+    "PD_ALTA",
+    "FLUSSI_PROTETTIVI",
+    "SQUILIBRIO_OPERATIVO"
+]
 
-    df["classe_operativa"] = df[prob_col].apply(
-        lambda x: assign_operational_band(
-            x,
-            threshold_non_toccare=threshold_non_toccare,
-            threshold_monitorare=threshold_monitorare
-        )
+base_engineered = df[[ID_COL] + engineered_cols].drop_duplicates(subset=[ID_COL], keep="first")
+test_scored = test_scored.merge(base_engineered, on=ID_COL, how="left")
+
+test_scored["classe_operativa"] = test_scored.apply(
+    lambda r: assegna_classe_operativa(
+        prob=r["prob_rischio"],
+        rt_buono=r["RT_BUONO"],
+        pd_alta=r["PD_ALTA"],
+        flussi_protettivi=r["FLUSSI_PROTETTIVI"]
+    ),
+    axis=1
+)
+
+# =========================================================
+# 12. CROSSTAB TEST
+# =========================================================
+print("\n" + "=" * 90)
+print("Crosstab fasce vs target - TEST SET")
+print("=" * 90)
+
+ct = pd.crosstab(test_scored["classe_operativa"], test_scored[TARGET_COL], margins=True)
+print(ct)
+
+# tassi per fascia
+summary = (
+    test_scored
+    .groupby("classe_operativa")
+    .agg(
+        n=(TARGET_COL, "size"),
+        prob_media=("prob_rischio", "mean"),
+        prob_min=("prob_rischio", "min"),
+        prob_max=("prob_rischio", "max"),
+        target_rate=(TARGET_COL, "mean")
     )
-
-    # ranking interno
-    df["rank_priorita"] = df[prob_col].rank(ascending=False, method="dense").astype(int)
-
-    return df
-
-
-def evaluate_binary_cut(y_true, y_proba, threshold):
-    y_pred = (y_proba >= threshold).astype(int)
-
-    print("=" * 90)
-    print(f"VALUTAZIONE BINARIA - threshold = {threshold:.4f}")
-    print("=" * 90)
-
-    print("\nConfusion matrix:")
-    print(confusion_matrix(y_true, y_pred))
-
-    print("\nClassification report:")
-    print(classification_report(y_true, y_pred, digits=4))
-
-    try:
-        auc = roc_auc_score(y_true, y_proba)
-        print(f"ROC AUC: {auc:.4f}")
-    except Exception as e:
-        print("ROC AUC non calcolabile:", e)
-
-
-def summarize_operational_bands(df, target_col=None):
-    if target_col is not None and target_col in df.columns:
-        summary = (
-            df.groupby("classe_operativa")
-              .agg(
-                  n_clienti=("classe_operativa", "size"),
-                  prob_min=("prob_tappeto_1", "min"),
-                  prob_media=("prob_tappeto_1", "mean"),
-                  prob_max=("prob_tappeto_1", "max"),
-                  target_rate=(target_col, "mean")
-              )
-              .sort_values("prob_media", ascending=False)
-              .reset_index()
-        )
-    else:
-        summary = (
-            df.groupby("classe_operativa")
-              .agg(
-                  n_clienti=("classe_operativa", "size"),
-                  prob_min=("prob_tappeto_1", "min"),
-                  prob_media=("prob_tappeto_1", "mean"),
-                  prob_max=("prob_tappeto_1", "max")
-              )
-              .sort_values("prob_media", ascending=False)
-              .reset_index()
-        )
-
-    return summary
-
-
-# =========================================================
-# 3. LETTURA DATI
-# =========================================================
-df = load_data(INPUT_FILE, SHEET_NAME)
-df = clean_columns(df)
-
-print("=" * 90)
-print("DATASET CARICATO")
-print("=" * 90)
-print("Shape iniziale:", df.shape)
-display(df.head())
-
-
-# =========================================================
-# 4. PULIZIA TARGET
-# =========================================================
-df = clean_target(df, TARGET_COL)
-
-
-# =========================================================
-# 5. FEATURE
-# =========================================================
-X, y, feature_columns, numeric_cols, categorical_cols = build_feature_lists(
-    df, TARGET_COL, ID_COL
+    .reset_index()
+    .sort_values("prob_media", ascending=False)
 )
 
-if REPLACE_9999_WITH_NAN and len(numeric_cols) > 0:
-    X = replace_sentinel_values(X, numeric_cols, sentinel=9999)
-
+print("\n" + "=" * 90)
+print("RIEPILOGO FASCE - TEST SET")
 print("=" * 90)
-print("FEATURE SET")
-print("=" * 90)
-print("Numero feature originali:", len(feature_columns))
-print("Numero feature numeriche:", len(numeric_cols))
-print("Numero feature categoriche:", len(categorical_cols))
-
+print(summary)
 
 # =========================================================
-# 6. TRAIN / TEST
+# 13. SCORING FULL DATASET
 # =========================================================
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
-    test_size=TEST_SIZE,
-    random_state=RANDOM_STATE,
-    stratify=y
+full_prob = model.predict_proba(X)[:, 1]
+full_pred = model.predict(X)
+
+scored_df = X.copy()
+scored_df[ID_COL] = id_series.values
+scored_df[TARGET_COL] = y.values
+scored_df["prob_rischio"] = full_prob
+scored_df["predizione_binaria"] = full_pred
+
+scored_df = scored_df.merge(base_engineered, on=ID_COL, how="left")
+
+scored_df["classe_operativa"] = scored_df.apply(
+    lambda r: assegna_classe_operativa(
+        prob=r["prob_rischio"],
+        rt_buono=r["RT_BUONO"],
+        pd_alta=r["PD_ALTA"],
+        flussi_protettivi=r["FLUSSI_PROTETTIVI"]
+    ),
+    axis=1
 )
 
-print("=" * 90)
-print("TRAIN / TEST")
-print("=" * 90)
-print("X_train:", X_train.shape)
-print("X_test :", X_test.shape)
-
-
 # =========================================================
-# 7. MODELLO
+# 14. ESTRAZIONE COEFFICIENTI ROBUSTA
 # =========================================================
-clf = build_pipeline(numeric_cols, categorical_cols)
-clf.fit(X_train, y_train)
-
-y_proba_test = clf.predict_proba(X_test)[:, 1]
+coef_df = pd.DataFrame()
 
 try:
-    auc = roc_auc_score(y_test, y_proba_test)
-    print(f"\nROC AUC TEST: {auc:.4f}")
+    fitted_preprocessor = model.named_steps["preprocessor"]
+    clf = model.named_steps["clf"]
+
+    feature_names = []
+
+    # numeriche
+    feature_names.extend(numeric_cols)
+
+    # categoriche
+    if len(categorical_cols) > 0:
+        cat_pipe = fitted_preprocessor.named_transformers_["cat"]
+        fitted_ohe = cat_pipe.named_steps["onehot"]
+
+        try:
+            cat_names = fitted_ohe.get_feature_names_out(categorical_cols).tolist()
+        except AttributeError:
+            cat_names = fitted_ohe.get_feature_names(categorical_cols).tolist()
+
+        feature_names.extend(cat_names)
+
+    coef = clf.coef_.ravel()
+
+    if len(feature_names) == len(coef):
+        coef_df = pd.DataFrame({
+            "feature": feature_names,
+            "coefficient": coef
+        })
+        coef_df["abs_coefficient"] = coef_df["coefficient"].abs()
+        coef_df = coef_df.sort_values("abs_coefficient", ascending=False)
+    else:
+        print("\nATTENZIONE: mismatch tra numero feature e coefficienti.")
+        print(f"Feature names: {len(feature_names)}")
+        print(f"Coefficienti: {len(coef)}")
+
 except Exception as e:
-    print("ROC AUC non calcolabile:", e)
-
-
-# =========================================================
-# 8. SOGLIE DINAMICHE SUL TEST SET
-# =========================================================
-threshold_non_toccare, threshold_monitorare = compute_dynamic_thresholds(
-    pd.Series(y_proba_test),
-    share_non_toccare=SHARE_NON_TOCCARE,
-    share_monitorare=SHARE_MONITORARE
-)
-
-print("=" * 90)
-print("SOGLIE DINAMICHE CALCOLATE SUL TEST SET")
-print("=" * 90)
-print(f"Quota NON_TOCCARE_ORA : {SHARE_NON_TOCCARE:.0%}")
-print(f"Quota MONITORARE      : {SHARE_MONITORARE:.0%}")
-print(f"Soglia NON_TOCCARE    : {threshold_non_toccare:.6f}")
-print(f"Soglia MONITORARE     : {threshold_monitorare:.6f}")
-
-print("\n")
-evaluate_binary_cut(y_test, y_proba_test, threshold_monitorare)
-
-
-# =========================================================
-# 9. ANALISI FASCE SUL TEST SET
-# =========================================================
-test_scored = X_test.copy()
-test_scored[TARGET_COL] = y_test.values
-test_scored["prob_tappeto_1"] = y_proba_test
-
-test_scored = add_operational_columns(
-    test_scored,
-    prob_col="prob_tappeto_1",
-    threshold_non_toccare=threshold_non_toccare,
-    threshold_monitorare=threshold_monitorare
-)
-
-print("=" * 90)
-print("DISTRIBUZIONE FASCE - TEST SET")
-print("=" * 90)
-display(
-    test_scored["classe_operativa"]
-    .value_counts(dropna=False)
-    .rename_axis("classe_operativa")
-    .reset_index(name="conteggio")
-)
-
-print("\nAnalisi fasce vs target - TEST SET")
-display(summarize_operational_bands(test_scored, TARGET_COL))
-
-print("\nCrosstab fasce vs target - TEST SET")
-display(pd.crosstab(test_scored["classe_operativa"], test_scored[TARGET_COL], margins=True))
-
-
-# =========================================================
-# 10. COEFFICIENTI MODELLO
-# =========================================================
-coef_df = extract_model_coefficients(clf)
+    print(f"\nImpossibile estrarre i coefficienti: {e}")
 
 if not coef_df.empty:
-    print("=" * 90)
+    print("\n" + "=" * 90)
     print("TOP COEFFICIENTI MODELLO - ASSOLUTI")
     print("=" * 90)
-    display(coef_df.head(30))
+    print(coef_df.head(25))
 
+    print("\n" + "=" * 90)
+    print("TOP COEFFICIENTI POSITIVI (AUMENTANO RISCHIO)")
     print("=" * 90)
-    print("TOP COEFFICIENTI POSITIVI")
-    print("=" * 90)
-    display(coef_df.sort_values("coefficient", ascending=False).head(20))
+    print(coef_df.sort_values("coefficient", ascending=False).head(20))
 
+    print("\n" + "=" * 90)
+    print("TOP COEFFICIENTI NEGATIVI (RIDUCONO RISCHIO)")
     print("=" * 90)
-    print("TOP COEFFICIENTI NEGATIVI")
-    print("=" * 90)
-    display(coef_df.sort_values("coefficient", ascending=True).head(20))
+    print(coef_df.sort_values("coefficient", ascending=True).head(20))
 else:
-    print("Nessun coefficiente estratto.")
-
-
-# =========================================================
-# 11. SCORING SU TUTTO IL DATASET
-# =========================================================
-df_scored = df.copy()
-
-X_full = df[feature_columns].copy()
-if REPLACE_9999_WITH_NAN and len(numeric_cols) > 0:
-    X_full = replace_sentinel_values(X_full, numeric_cols, sentinel=9999)
-
-df_scored["prob_tappeto_1"] = clf.predict_proba(X_full)[:, 1]
-
-# puoi scegliere:
-# A) usare le soglie calcolate sul test set
-# B) ricalcolare le quote sul full dataset
-# sotto uso B, più coerente con la capacità operativa finale
-threshold_non_toccare_full, threshold_monitorare_full = compute_dynamic_thresholds(
-    df_scored["prob_tappeto_1"],
-    share_non_toccare=SHARE_NON_TOCCARE,
-    share_monitorare=SHARE_MONITORARE
-)
-
-df_scored = add_operational_columns(
-    df_scored,
-    prob_col="prob_tappeto_1",
-    threshold_non_toccare=threshold_non_toccare_full,
-    threshold_monitorare=threshold_monitorare_full
-)
-
-df_scored = df_scored.sort_values("prob_tappeto_1", ascending=False).reset_index(drop=True)
-
-print("=" * 90)
-print("SOGLIE DINAMICHE - FULL DATASET")
-print("=" * 90)
-print(f"Soglia NON_TOCCARE full: {threshold_non_toccare_full:.6f}")
-print(f"Soglia MONITORARE full : {threshold_monitorare_full:.6f}")
-
-print("\nDistribuzione classi operative - FULL DATASET")
-display(
-    df_scored["classe_operativa"]
-    .value_counts(dropna=False)
-    .rename_axis("classe_operativa")
-    .reset_index(name="conteggio")
-)
-
-print("\nAnalisi fasce vs target - FULL DATASET")
-display(summarize_operational_bands(df_scored, TARGET_COL))
-
-print("\nCrosstab fasce vs target - FULL DATASET")
-display(pd.crosstab(df_scored["classe_operativa"], df_scored[TARGET_COL], margins=True))
-
-print("\nTop clienti per probabilità:")
-display(df_scored.head(20))
-
+    print("\nNessun coefficiente estratto.")
 
 # =========================================================
-# 12. SALVATAGGIO
+# 15. OUTPUT FILE
 # =========================================================
-output_scored_path = os.path.join(OUTPUT_DIR, "dataset_scored_operativo_v2.xlsx")
-df_scored.to_excel(output_scored_path, index=False)
+output_scored_path = os.path.join(OUTPUT_DIR, SCORED_FILE)
+coef_output_path = os.path.join(OUTPUT_DIR, COEF_FILE)
+model_path = os.path.join(OUTPUT_DIR, MODEL_NAME)
 
-# salvo anche i coefficienti, se disponibili
-coef_output_path = os.path.join(OUTPUT_DIR, "coefficienti_modello_v2.xlsx")
+# salvataggio excel con piu' sheet
+with pd.ExcelWriter(output_scored_path, engine="openpyxl") as writer:
+    scored_df.to_excel(writer, sheet_name="scoring_full", index=False)
+    test_scored.to_excel(writer, sheet_name="test_scored", index=False)
+    summary.to_excel(writer, sheet_name="summary_test", index=False)
+    ct.to_excel(writer, sheet_name="crosstab_test")
+
 if not coef_df.empty:
     coef_df.to_excel(coef_output_path, index=False)
 
+# bundle con metadata utili
 model_bundle = {
-    "pipeline": clf,
-    "feature_columns": feature_columns,
+    "model": model,
     "numeric_cols": numeric_cols,
     "categorical_cols": categorical_cols,
+    "engineered_cols": engineered_cols,
     "target_col": TARGET_COL,
     "id_col": ID_COL,
-    "share_non_toccare": SHARE_NON_TOCCARE,
-    "share_monitorare": SHARE_MONITORARE,
-    "threshold_non_toccare_test": threshold_non_toccare,
-    "threshold_monitorare_test": threshold_monitorare,
-    "threshold_non_toccare_full": threshold_non_toccare_full,
-    "threshold_monitorare_full": threshold_monitorare_full,
-    "replace_9999_with_nan": REPLACE_9999_WITH_NAN
+    "threshold_non_toccare": THRESH_NON_TOCCARE,
+    "threshold_monitorare": THRESH_MONITORARE,
+    "version": "V2_RT_CORRETTA"
 }
 
-model_path = os.path.join(OUTPUT_DIR, "modello_cluster_tappeto_operativo_v2.joblib")
 joblib.dump(model_bundle, model_path)
 
-print("=" * 90)
+# =========================================================
+# 16. REPORT FINALE
+# =========================================================
+print("\n" + "=" * 90)
 print("SALVATAGGIO COMPLETATO")
 print("=" * 90)
 print("Output scoring:", output_scored_path)
 if not coef_df.empty:
     print("Output coefficienti:", coef_output_path)
 print("Modello:", model_path)
+
+print("\n" + "=" * 90)
+print("DISTRIBUZIONE CLASSI OPERATIVE - FULL DATASET")
+print("=" * 90)
+print(scored_df["classe_operativa"].value_counts(dropna=False))
+
+print("\n" + "=" * 90)
+print("RECIDIVITA vs TARGET - FULL DATASET")
+print("=" * 90)
+print(pd.crosstab(df["RECIDIVITA"], df[TARGET_COL], margins=True))
+
+print("\n" + "=" * 90)
+print("RT_BUONO vs TARGET - FULL DATASET")
+print("=" * 90)
+print(pd.crosstab(scored_df["RT_BUONO"], scored_df[TARGET_COL], margins=True))
