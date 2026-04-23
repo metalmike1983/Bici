@@ -1,36 +1,151 @@
+# =========================================
+# MODELLO SELF-CURE (TAPPETO) - XGBOOST
+# =========================================
 
-import streamlit as st
-from datetime import datetime, timedelta
 import pandas as pd
-import time
+import numpy as np
 
-st.set_page_config(page_title="Contatore Biciclette", page_icon="🚲")
-st.title("🚲 Biciclette Vendute in Tempo Reale")
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.impute import SimpleImputer
 
-# Data di partenza fissa
-start_time = datetime(2024, 1, 1, 0, 0, 0)
-now = datetime.utcnow()
-minutes_passed = int((now - start_time).total_seconds() // 180)
-vendite_reali = minutes_passed
+from xgboost import XGBClassifier
 
-# Session state per vendite simulate
-if 'vendite_simulate' not in st.session_state:
-    st.session_state.vendite_simulate = 0
+# ==============================
+# CONFIG
+# ==============================
+INPUT_FILE = r"C:\Users\...\cl4.xlsx"
+TARGET = "Cluster"
+ID_COL = "ndg"
 
-# Bottone per simulare una nuova vendita
-if st.button("🛒 Simula nuova vendita"):
-    st.session_state.vendite_simulate += 1
+TEST_SIZE = 0.3
+RANDOM_STATE = 42
 
-# Totale vendite
-totale_vendite = vendite_reali + st.session_state.vendite_simulate
-st.metric("Biciclette vendute", f"{totale_vendite:,}".replace(",", "."))
+# ==============================
+# LOAD
+# ==============================
+df = pd.read_excel(INPUT_FILE)
+df.columns = [c.strip() for c in df.columns]
 
-# Grafico delle vendite simulate nel tempo (esempio fittizio)
-st.subheader("📈 Andamento stimato delle vendite")
-# Creiamo una serie temporale fittizia
-times = [now - timedelta(days=i) for i in range(30)][::-1]
-vendite_giornaliere = [int((i * 24 * 60) / 180 + st.session_state.vendite_simulate // 30) for i in range(30)]
-df = pd.DataFrame({'Data': times, 'Biciclette vendute': vendite_giornaliere})
-st.line_chart(df.set_index('Data'))
+# ==============================
+# TARGET CLEAN
+# ==============================
+df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
+df = df[df[TARGET].notna()]
+df[TARGET] = df[TARGET].astype(int)
 
-st.caption("⚙️ Una bicicletta viene venduta ogni 3 minuti, a partire dal 1° gennaio 2024. Simula vendite cliccando sul bottone.")
+# ==============================
+# CLEAN 9999 / SENTINEL
+# ==============================
+df = df.replace([9999, -9999], np.nan)
+
+# ==============================
+# DROP LEAKAGE (CRITICO)
+# ==============================
+LEAKAGE = [
+    "RATING_MINORE",
+    "FASCIA_RISCHIO",
+    "COD_FASCIA_RISCHIO",
+    "RECIDIVITA",
+    "FLAG_RECIDIVO",
+    "S_TREND_STATUS"
+]
+
+df = df.drop(columns=[c for c in LEAKAGE if c in df.columns], errors="ignore")
+
+# ==============================
+# FEATURE ENGINEERING (CHIAVE)
+# ==============================
+
+# protezione divisioni
+def safe_div(a, b):
+    return a / (b + 1e-6)
+
+# esempio colonne (adatta ai tuoi nomi reali)
+if "SALDO" in df.columns and "IMP_RATA_MENS" in df.columns:
+    df["buffer"] = safe_div(df["SALDO"], df["IMP_RATA_MENS"])
+
+if "IMP_UTILZ_TOT" in df.columns and "SALDO" in df.columns:
+    df["util_ratio"] = safe_div(df["IMP_UTILZ_TOT"], df["SALDO"])
+
+if "NUM_STIPENDI_3M" in df.columns:
+    df["salary_regularity"] = df["NUM_STIPENDI_3M"] / 3
+
+if "SALDO" in df.columns and "SALDO_3M" in df.columns:
+    df["saldo_trend"] = df["SALDO"] - df["SALDO_3M"]
+
+# ==============================
+# FEATURE SET
+# ==============================
+exclude_cols = [TARGET, ID_COL]
+features = [c for c in df.columns if c not in exclude_cols]
+
+X = df[features].copy()
+y = df[TARGET].copy()
+
+# ==============================
+# NUMERIC ONLY (XGBoost friendly)
+# ==============================
+for col in X.columns:
+    X[col] = pd.to_numeric(X[col], errors="coerce")
+
+# imputazione semplice
+imputer = SimpleImputer(strategy="median")
+X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
+
+# ==============================
+# SPLIT
+# ==============================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=y
+)
+
+# ==============================
+# MODELLO XGBOOST
+# ==============================
+model = XGBClassifier(
+    n_estimators=300,
+    max_depth=5,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=RANDOM_STATE,
+    eval_metric="logloss"
+)
+
+model.fit(X_train, y_train)
+
+# ==============================
+# EVALUATION
+# ==============================
+y_pred = model.predict(X_test)
+y_prob = model.predict_proba(X_test)[:, 1]
+
+print("\n=== CLASSIFICATION REPORT ===")
+print(classification_report(y_test, y_pred))
+
+print("\n=== ROC AUC ===")
+print(roc_auc_score(y_test, y_prob))
+
+# ==============================
+# FEATURE IMPORTANCE
+# ==============================
+importance = pd.DataFrame({
+    "feature": X.columns,
+    "importance": model.feature_importances_
+}).sort_values("importance", ascending=False)
+
+print("\n=== TOP FEATURE ===")
+print(importance.head(20))
+
+# ==============================
+# SCORING COMPLETO
+# ==============================
+df["prob_tappeto"] = model.predict_proba(X)[:, 1]
+df = df.sort_values("prob_tappeto", ascending=False)
+
+print("\n=== TOP CLIENTI ===")
+print(df[[ID_COL, "prob_tappeto"]].head(20))
