@@ -1,56 +1,495 @@
 # =========================================
-# 1. IMPORT
+# CLUSTER TAPPETO / SELF-CURE MODEL
+# VERSIONE UNICA - XGBOOST + ROI + SCORING
 # =========================================
-import pandas as pd
-import numpy as np
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
 import joblib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from IPython.display import display
 
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score
+)
 
 from xgboost import XGBClassifier
 
-# =========================================
-# 2. CONFIG
-# =========================================
-TARGET = "Cluster"
+
+# =========================================================
+# CONFIG
+# =========================================================
+INPUT_FILE = r"C:\Users\YOUR_USER\Desktop\cl4.xlsx"
+SHEET_NAME = 0
+
+TARGET_COL = "Cluster"     # 1 = autoregolarizza / tappeto
 ID_COL = "ndg"
 
-# =========================================
-# 3. FEATURE ENGINEERING
-# =========================================
+OUTPUT_DIR = r"output_tappeto_xgb"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-df = df.copy()
+TEST_SIZE = 0.30
+RANDOM_STATE = 42
+THRESHOLD = 0.40   # soglia operativa per classe 1
 
-df["CAPACITA_RIENTRO"] = df["CC_IMP_STIPEND_AVG_3M"] - df["F_IMP_SCONFNTO_TOT_UM"]
-df["STRESS_RATIO"] = df["F_IMP_SCONFNTO_TOT_UM"] / (df["CC_IMP_STIPEND_AVG_3M"] + 1)
-df["LIQUIDITA_NETTA"] = df["CC_SALDO_AVG_3M"] - df["F_IMP_SCONFNTO_TOT_UM"]
-df["ATTIVITA_3M"] = df["CC_IMP_CONTANTI_AVG_3M"] + df["CC_IMP_UTENZE_AVG_3M"]
-df["LEVA_CF"] = df["F_PER_UTILZ_CF_UM"]
+# ROI - personalizza questi valori
+COSTO_CONTATTO = 5.0
+RECUPERO_MEDIO = 200.0
 
-# =========================================
-# 4. SPLIT X / y
-# =========================================
+# colonne da escludere perché leakage / post-evento / target-like
+LEAKAGE_COLS = [
+    "RATING_MINORE",
+    "FASCIA_RISCHIO",
+    "COD_FASCIA_RISCHIO",
+    "FLAG_RECIDIVO",
+    "S_TREND_STATUS",
+    "NUM_GG_DA_USCITA",
+    "GG_IRREGOLARE",
+    "GG_ULTIMA_AZIONE",
+    "DT_CONT"  # se la usi come data grezza, meglio toglierla
+]
 
-drop_cols = [TARGET, ID_COL, "MESE"]
-X = df.drop(columns=[c for c in drop_cols if c in df.columns])
-y = df[TARGET]
+# opzionali: tieni o togli a seconda della tua policy
+BORDERLINE_COLS = [
+    # "RECIDIVITA",
+    # "R_PD_ULT_MENO_3MESI",
+    # "MESE",
+]
 
-# =========================================
-# 5. COLONNE
-# =========================================
+# colonne numeriche sentinella da convertire in NaN
+SENTINEL_VALUES = [9999, -9999, 999999, -999999]
 
-num_cols = X.select_dtypes(exclude=["object"]).columns.tolist()
-cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
+# nomi colonne attese per feature engineering
+COL_STIP_AVG_3M = "CC_IMP_STIPEND_AVG_3M"
+COL_SCONF_TOT = "F_IMP_SCONFNMNTO_TOT_UM"
+COL_SALDO_AVG_3M = "CC_SALDO_AVG_3M"
+COL_CONTANTI_AVG_3M = "CC_IMP_CONTANTI_AVG_3M"
+COL_UTENZE_AVG_3M = "CC_IMP_UTENZE_AVG_3M"
+COL_UTILZ_CF = "F_PER_UTILZ_CF_UM"
+COL_NUM_STIP_AVG_3M = "CC_NUM_STIPEND_AVG_3M"
+COL_TREND_STIP_3_12M = "CC_TREND_STIPEND_3_12M"
+COL_PD_ULT_3M = "R_PD_ULT_MENO_3MESI"
 
-# =========================================
-# 6. PREPROCESSING
-# =========================================
 
+# =========================================================
+# FUNZIONI
+# =========================================================
+def load_data(file_path, sheet_name=0):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in [".xlsx", ".xls", ".xlsm"]:
+        return pd.read_excel(file_path, sheet_name=sheet_name)
+    elif ext == ".csv":
+        return pd.read_csv(file_path)
+    else:
+        raise ValueError(f"Formato file non supportato: {ext}")
+
+
+def standardize_columns(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def safe_div(a, b):
+    return a / (b + 1e-6)
+
+
+def add_feature_if_possible(df, new_col, func, required_cols):
+    if all(c in df.columns for c in required_cols):
+        try:
+            df[new_col] = func(df)
+        except Exception as e:
+            print(f"[WARN] impossibile creare {new_col}: {e}")
+
+
+def feature_engineering(df):
+    df = df.copy()
+
+    # coerci numeriche "probabili"
+    for col in df.columns:
+        if df[col].dtype == "object":
+            s = df[col].astype(str).str.strip()
+
+            # tentativo soft di conversione
+            s2 = s.str.replace(" ", "", regex=False)
+            s2 = s2.str.replace(".", "", regex=False)
+            s2 = s2.str.replace(",", ".", regex=False)
+            converted = pd.to_numeric(s2, errors="coerce")
+
+            # converte solo se almeno il 70% è interpretabile come numero
+            if converted.notna().mean() >= 0.70:
+                df[col] = converted
+
+    df = df.replace(SENTINEL_VALUES, np.nan)
+
+    # ============================
+    # FEATURE ENGINEERING BUSINESS
+    # ============================
+    add_feature_if_possible(
+        df,
+        "CAPACITA_RIENTRO",
+        lambda x: x[COL_STIP_AVG_3M] - x[COL_SCONF_TOT],
+        [COL_STIP_AVG_3M, COL_SCONF_TOT]
+    )
+
+    add_feature_if_possible(
+        df,
+        "STRESS_RATIO",
+        lambda x: safe_div(x[COL_SCONF_TOT], x[COL_STIP_AVG_3M] + 1),
+        [COL_STIP_AVG_3M, COL_SCONF_TOT]
+    )
+
+    add_feature_if_possible(
+        df,
+        "LIQUIDITA_NETTA",
+        lambda x: x[COL_SALDO_AVG_3M] - x[COL_SCONF_TOT],
+        [COL_SALDO_AVG_3M, COL_SCONF_TOT]
+    )
+
+    add_feature_if_possible(
+        df,
+        "ATTIVITA_3M",
+        lambda x: x[COL_CONTANTI_AVG_3M] + x[COL_UTENZE_AVG_3M],
+        [COL_CONTANTI_AVG_3M, COL_UTENZE_AVG_3M]
+    )
+
+    add_feature_if_possible(
+        df,
+        "LEVA_CF",
+        lambda x: x[COL_UTILZ_CF],
+        [COL_UTILZ_CF]
+    )
+
+    add_feature_if_possible(
+        df,
+        "SALARY_REGULARITY",
+        lambda x: safe_div(x[COL_NUM_STIP_AVG_3M], 3),
+        [COL_NUM_STIP_AVG_3M]
+    )
+
+    add_feature_if_possible(
+        df,
+        "CAPACITA_RIENTRO_RELATIVA",
+        lambda x: safe_div(x[COL_STIP_AVG_3M], x[COL_SCONF_TOT] + 1),
+        [COL_STIP_AVG_3M, COL_SCONF_TOT]
+    )
+
+    add_feature_if_possible(
+        df,
+        "ATTIVITA_SU_STIPENDIO",
+        lambda x: safe_div(
+            x[COL_CONTANTI_AVG_3M] + x[COL_UTENZE_AVG_3M],
+            x[COL_STIP_AVG_3M] + 1
+        ),
+        [COL_CONTANTI_AVG_3M, COL_UTENZE_AVG_3M, COL_STIP_AVG_3M]
+    )
+
+    add_feature_if_possible(
+        df,
+        "SALDO_SU_SCONF",
+        lambda x: safe_div(x[COL_SALDO_AVG_3M], x[COL_SCONF_TOT] + 1),
+        [COL_SALDO_AVG_3M, COL_SCONF_TOT]
+    )
+
+    add_feature_if_possible(
+        df,
+        "TREND_STIPEND_POSITIVO",
+        lambda x: (x[COL_TREND_STIP_3_12M] > 0).astype(int),
+        [COL_TREND_STIP_3_12M]
+    )
+
+    add_feature_if_possible(
+        df,
+        "RECIDIVITA_BREVE_FLAG",
+        lambda x: (x[COL_PD_ULT_3M].fillna(0) > 0).astype(int),
+        [COL_PD_ULT_3M]
+    )
+
+    return df
+
+
+def build_segments(prob):
+    if prob >= 0.70:
+        return "AUTO"
+    elif prob >= 0.40:
+        return "SOFT"
+    else:
+        return "HARD"
+
+
+def save_excel_report(path, sheets_dict):
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for sheet_name, df_sheet in sheets_dict.items():
+            if df_sheet is None:
+                continue
+            if not isinstance(df_sheet, pd.DataFrame):
+                df_sheet = pd.DataFrame(df_sheet)
+            df_sheet.to_excel(writer, sheet_name=str(sheet_name)[:31], index=False)
+
+
+def compute_feature_importance_from_pipeline(clf):
+    try:
+        preprocessor = clf.named_steps["preprocessor"]
+        model = clf.named_steps["model"]
+
+        feature_names = preprocessor.get_feature_names_out()
+        importances = model.feature_importances_
+
+        feat_imp = pd.DataFrame({
+            "feature": feature_names,
+            "importance": importances
+        }).sort_values("importance", ascending=False).reset_index(drop=True)
+
+        return feat_imp
+    except Exception as e:
+        print(f"[WARN] impossibile estrarre feature importance: {e}")
+        return pd.DataFrame(columns=["feature", "importance"])
+
+
+def evaluate_thresholds(y_true, y_proba, costs_contact=5.0, avg_recovery=200.0):
+    thresholds = np.linspace(0.05, 0.95, 19)
+    rows = []
+
+    for t in thresholds:
+        pred_auto = (y_proba >= t).astype(int)  # 1 = AUTO / non contattare
+        # contatto chi NON è auto
+        contact_flag = 1 - pred_auto
+
+        contacts = int(contact_flag.sum())
+
+        # recuperi: contatto e cliente realmente non tappeto (target=0)
+        recovered = int(((contact_flag == 1) & (y_true == 0)).sum())
+
+        cost = contacts * costs_contact
+        revenue = recovered * avg_recovery
+        profit = revenue - cost
+
+        rows.append({
+            "threshold": t,
+            "contacts": contacts,
+            "recovered_non_tappeto": recovered,
+            "cost": cost,
+            "revenue": revenue,
+            "profit": profit
+        })
+
+    return pd.DataFrame(rows).sort_values("profit", ascending=False).reset_index(drop=True)
+
+
+def build_lift_table(y_true, y_proba):
+    df_lift = pd.DataFrame({
+        "y_true": y_true,
+        "prob_tappeto": y_proba
+    }).sort_values("prob_tappeto", ascending=False).reset_index(drop=True)
+
+    df_lift["rank"] = np.arange(1, len(df_lift) + 1)
+    df_lift["perc"] = df_lift["rank"] / len(df_lift)
+
+    total_positive = df_lift["y_true"].sum()
+    df_lift["cum_positive"] = df_lift["y_true"].cumsum()
+    df_lift["lift"] = np.where(
+        df_lift["perc"] > 0,
+        df_lift["cum_positive"] / (df_lift["perc"] * total_positive),
+        np.nan
+    )
+    return df_lift
+
+
+def score_new_file(model_path, new_file_path, output_file_path, sheet_name=0):
+    clf = joblib.load(model_path)
+
+    new_df = load_data(new_file_path, sheet_name=sheet_name)
+    new_df = standardize_columns(new_df)
+    new_df = feature_engineering(new_df)
+
+    drop_cols = [c for c in [TARGET_COL, ID_COL] if c in new_df.columns]
+    X_new = new_df.drop(columns=drop_cols, errors="ignore")
+
+    new_df["prob_tappeto"] = clf.predict_proba(X_new)[:, 1]
+    new_df["pred_tappeto"] = (new_df["prob_tappeto"] >= THRESHOLD).astype(int)
+    new_df["segmento"] = new_df["prob_tappeto"].apply(build_segments)
+
+    new_df = new_df.sort_values("prob_tappeto", ascending=False).reset_index(drop=True)
+    new_df.to_excel(output_file_path, index=False)
+
+    print(f"\nScoring completato. File salvato in: {output_file_path}")
+    display(new_df.head(20))
+    return new_df
+
+
+# =========================================================
+# 1. LETTURA DATI
+# =========================================================
+df = load_data(INPUT_FILE, SHEET_NAME)
+df = standardize_columns(df)
+
+print("=" * 90)
+print("DATASET CARICATO")
+print("=" * 90)
+print("Shape iniziale:", df.shape)
+display(df.head())
+
+
+# =========================================================
+# 2. FEATURE ENGINEERING + CLEAN
+# =========================================================
+df = feature_engineering(df)
+
+print("\nShape dopo feature engineering:", df.shape)
+
+if TARGET_COL not in df.columns:
+    raise ValueError(f"La colonna target '{TARGET_COL}' non esiste nel dataset.")
+
+df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce")
+df = df[df[TARGET_COL].notna()].copy()
+df[TARGET_COL] = df[TARGET_COL].astype(int)
+
+if df.empty:
+    raise ValueError("Il dataset è vuoto dopo la pulizia del target.")
+
+print("\nDistribuzione target:")
+display(
+    df[TARGET_COL]
+    .value_counts(dropna=False)
+    .rename_axis("classe")
+    .reset_index(name="conteggio")
+)
+
+
+# =========================================================
+# 3. DROP COLONNE SPORCHE / LEAKAGE
+# =========================================================
+drop_cols = [TARGET_COL]
+
+if ID_COL in df.columns:
+    drop_cols.append(ID_COL)
+
+drop_cols += [c for c in LEAKAGE_COLS if c in df.columns]
+drop_cols += [c for c in BORDERLINE_COLS if c in df.columns]
+
+X = df.drop(columns=drop_cols, errors="ignore").copy()
+y = df[TARGET_COL].copy()
+
+# elimina colonne completamente vuote
+X = X.loc[:, X.notna().sum() > 0].copy()
+
+print("\nNumero feature candidate:", X.shape[1])
+
+# tipi colonna
+num_cols = X.select_dtypes(exclude=["object", "category", "bool"]).columns.tolist()
+cat_cols = X.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+
+print("Feature numeriche:", len(num_cols))
+print("Feature categoriche:", len(cat_cols))
+
+print("\nPrime feature numeriche:")
+print(num_cols[:20])
+
+print("\nPrime feature categoriche:")
+print(cat_cols[:20])
+
+
+# =========================================================
+# 4. PROFILO DESCRITTIVO TAPPETO=1
+# =========================================================
+df_pos = df[df[TARGET_COL] == 1].copy()
+df_neg = df[df[TARGET_COL] == 0].copy()
+
+numeric_profile_rows = []
+for col in num_cols:
+    try:
+        pos_mean = df_pos[col].mean()
+        neg_mean = df_neg[col].mean()
+        pos_median = df_pos[col].median()
+        neg_median = df_neg[col].median()
+        diff_mean = pos_mean - neg_mean
+
+        numeric_profile_rows.append({
+            "variabile": col,
+            "mean_tappeto_1": pos_mean,
+            "median_tappeto_1": pos_median,
+            "mean_tappeto_0": neg_mean,
+            "median_tappeto_0": neg_median,
+            "diff_mean": diff_mean,
+            "abs_diff_mean": abs(diff_mean) if pd.notna(diff_mean) else np.nan
+        })
+    except Exception:
+        pass
+
+numeric_profile_df = pd.DataFrame(numeric_profile_rows)
+if not numeric_profile_df.empty:
+    numeric_profile_df = numeric_profile_df.sort_values(
+        "abs_diff_mean", ascending=False
+    ).reset_index(drop=True)
+
+print("\nTop differenze variabili numeriche:")
+display(numeric_profile_df.head(20))
+
+categorical_profile_all = []
+for col in cat_cols:
+    try:
+        tmp = (
+            df.groupby([col, TARGET_COL], dropna=False)
+            .size()
+            .reset_index(name="n")
+        )
+
+        pivot = tmp.pivot_table(
+            index=col,
+            columns=TARGET_COL,
+            values="n",
+            fill_value=0
+        )
+
+        pivot.columns = [f"count_target_{int(c)}" for c in pivot.columns]
+        pivot = pivot.reset_index()
+
+        if "count_target_1" not in pivot.columns:
+            pivot["count_target_1"] = 0
+        if "count_target_0" not in pivot.columns:
+            pivot["count_target_0"] = 0
+
+        pivot["total"] = pivot["count_target_1"] + pivot["count_target_0"]
+        pivot["pct_tappeto_1_nel_livello"] = np.where(
+            pivot["total"] > 0,
+            pivot["count_target_1"] / pivot["total"],
+            np.nan
+        )
+        pivot["variabile"] = col
+
+        pivot = pivot.sort_values(
+            ["pct_tappeto_1_nel_livello", "count_target_1"],
+            ascending=[False, False]
+        )
+
+        categorical_profile_all.append(pivot.head(10))
+    except Exception:
+        pass
+
+categorical_profile_df = (
+    pd.concat(categorical_profile_all, ignore_index=True)
+    if categorical_profile_all else pd.DataFrame()
+)
+
+print("\nTop livelli categorici associati a tappeto=1:")
+display(categorical_profile_df.head(40))
+
+
+# =========================================================
+# 5. PREPROCESSING
+# =========================================================
 numeric_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="median"))
 ])
@@ -67,10 +506,10 @@ preprocessor = ColumnTransformer(
     ]
 )
 
-# =========================================
-# 7. MODELLO
-# =========================================
 
+# =========================================================
+# 6. MODELLO XGBOOST
+# =========================================================
 model = XGBClassifier(
     n_estimators=400,
     max_depth=4,
@@ -78,61 +517,163 @@ model = XGBClassifier(
     subsample=0.8,
     colsample_bytree=0.8,
     eval_metric="auc",
-    random_state=42
+    random_state=RANDOM_STATE
 )
-
-# =========================================
-# 8. PIPELINE
-# =========================================
 
 clf = Pipeline(steps=[
     ("preprocessor", preprocessor),
     ("model", model)
 ])
 
-# =========================================
-# 9. TRAIN TEST
-# =========================================
+
+# =========================================================
+# 7. TRAIN / TEST
+# =========================================================
+if y.nunique() < 2:
+    raise ValueError("Il target ha una sola classe: impossibile allenare il modello.")
 
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
-    test_size=0.3,
-    random_state=42,
+    X,
+    y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
     stratify=y
 )
 
-# =========================================
-# 10. TRAIN
-# =========================================
-
 clf.fit(X_train, y_train)
 
-# =========================================
-# 11. EVALUATION
-# =========================================
 
-y_proba = clf.predict_proba(X_test)[:,1]
+# =========================================================
+# 8. EVALUATION
+# =========================================================
+y_proba = clf.predict_proba(X_test)[:, 1]
+y_pred = (y_proba >= THRESHOLD).astype(int)
 
-threshold = 0.40
-y_pred = (y_proba > threshold).astype(int)
+print("\n=== CONFUSION MATRIX ===")
+print(confusion_matrix(y_test, y_pred))
 
 print("\n=== CLASSIFICATION REPORT ===")
-print(classification_report(y_test, y_pred))
+print(classification_report(y_test, y_pred, digits=4))
 
+auc = roc_auc_score(y_test, y_proba)
 print("\n=== ROC AUC ===")
-print(roc_auc_score(y_test, y_proba))
+print(auc)
 
-# =========================================
-# 12. FEATURE IMPORTANCE (opzionale)
-# =========================================
 
-model_step = clf.named_steps["model"]
-print("\nFeature importance disponibili via model_step.feature_importances_")
+# =========================================================
+# 9. FEATURE IMPORTANCE
+# =========================================================
+feat_imp = compute_feature_importance_from_pipeline(clf)
 
-# =========================================
-# 13. SALVATAGGIO
-# =========================================
+print("\n=== TOP FEATURE ===")
+display(feat_imp.head(30))
 
-joblib.dump(clf, "modello_tappeto_xgb.joblib")
 
-print("\nModello salvato")
+# =========================================================
+# 10. SCORING COMPLETO
+# =========================================================
+df_scored = df.copy()
+df_scored["prob_tappeto"] = clf.predict_proba(X)[:, 1]
+df_scored["pred_tappeto"] = (df_scored["prob_tappeto"] >= THRESHOLD).astype(int)
+df_scored["segmento"] = df_scored["prob_tappeto"].apply(build_segments)
+
+top_cols = [c for c in [ID_COL, "prob_tappeto", "pred_tappeto", "segmento", TARGET_COL] if c in df_scored.columns]
+top_clients = df_scored[top_cols].sort_values("prob_tappeto", ascending=False).reset_index(drop=True)
+
+print("\n=== TOP CLIENTI ===")
+display(top_clients.head(20))
+
+
+# =========================================================
+# 11. LIFT TABLE
+# =========================================================
+lift_df = build_lift_table(y_test.reset_index(drop=True), pd.Series(y_proba))
+print("\n=== LIFT TABLE ===")
+display(lift_df[["perc", "lift"]].head(20))
+
+plt.figure(figsize=(8, 5))
+plt.plot(lift_df["perc"], lift_df["lift"])
+plt.xlabel("Percentuale clienti selezionati")
+plt.ylabel("Lift")
+plt.title("Lift Curve")
+plt.grid(True)
+plt.show()
+
+
+# =========================================================
+# 12. ROI TABLE
+# =========================================================
+roi_df = evaluate_thresholds(
+    y_true=y_test.reset_index(drop=True),
+    y_proba=y_proba,
+    costs_contact=COSTO_CONTATTO,
+    avg_recovery=RECUPERO_MEDIO
+)
+
+print("\n=== TOP SOGLIE ROI ===")
+display(roi_df.head(10))
+
+best_threshold = roi_df.iloc[0]["threshold"]
+print(f"\nMiglior threshold per profitto simulato: {best_threshold:.2f}")
+
+plt.figure(figsize=(8, 5))
+plt.plot(roi_df["threshold"], roi_df["profit"])
+plt.xlabel("Threshold")
+plt.ylabel("Profitto simulato")
+plt.title("Profitto vs Threshold")
+plt.grid(True)
+plt.show()
+
+
+# =========================================================
+# 13. FILE DI OUTPUT
+# =========================================================
+feature_path = os.path.join(OUTPUT_DIR, "feature_importance_tappeto.xlsx")
+profile_num_path = os.path.join(OUTPUT_DIR, "profilo_numerico_tappeto.xlsx")
+profile_cat_path = os.path.join(OUTPUT_DIR, "profilo_categorico_tappeto.xlsx")
+scored_path = os.path.join(OUTPUT_DIR, "dataset_scored_tappeto.xlsx")
+top_path = os.path.join(OUTPUT_DIR, "top_clienti_prob_tappeto.xlsx")
+report_path = os.path.join(OUTPUT_DIR, "report_tappeto_xgb.xlsx")
+model_path = os.path.join(OUTPUT_DIR, "modello_tappeto_xgb.joblib")
+
+feat_imp.to_excel(feature_path, index=False)
+numeric_profile_df.to_excel(profile_num_path, index=False)
+categorical_profile_df.to_excel(profile_cat_path, index=False)
+df_scored.to_excel(scored_path, index=False)
+top_clients.to_excel(top_path, index=False)
+
+save_excel_report(
+    report_path,
+    {
+        "feature_importance": feat_imp,
+        "profilo_numerico": numeric_profile_df,
+        "profilo_categorico": categorical_profile_df,
+        "top_clienti": top_clients.head(500),
+        "lift_table": lift_df,
+        "roi_table": roi_df
+    }
+)
+
+joblib.dump(clf, model_path)
+
+print("\n" + "=" * 90)
+print("FILE SALVATI")
+print("=" * 90)
+print("Feature importance:", feature_path)
+print("Profilo numerico:", profile_num_path)
+print("Profilo categorico:", profile_cat_path)
+print("Dataset scored:", scored_path)
+print("Top clienti:", top_path)
+print("Report Excel:", report_path)
+print("Modello salvato:", model_path)
+
+
+# =========================================================
+# 14. ESEMPIO RIUTILIZZO SU NUOVO FILE
+# =========================================================
+# Decommenta quando vuoi applicare il modello a una nuova lista:
+#
+# score_new_file(
+#     model_path=model_path,
+#     new_file_path=r"C:\Users\YOUR_USER\Desktop\nuova_lista_ndg.xlsx",
+#     output_file_path=os.path.jo
