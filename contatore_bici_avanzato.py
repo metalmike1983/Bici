@@ -1,151 +1,147 @@
 # =========================================
-# MODELLO SELF-CURE (TAPPETO) - XGBOOST
+# 1. IMPORT
 # =========================================
-
 import pandas as pd
 import numpy as np
-
+from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score
-from sklearn.impute import SimpleImputer
 
-from xgboost import XGBClassifier
-
-# ==============================
-# CONFIG
-# ==============================
-INPUT_FILE = r"C:\Users\...\cl4.xlsx"
-TARGET = "Cluster"
+# =========================================
+# 2. CONFIG
+# =========================================
+TARGET = "Cluster"   # tappeto = 1
 ID_COL = "ndg"
 
-TEST_SIZE = 0.3
-RANDOM_STATE = 42
+# =========================================
+# 3. FEATURE ENGINEERING
+# =========================================
 
-# ==============================
-# LOAD
-# ==============================
-df = pd.read_excel(INPUT_FILE)
-df.columns = [c.strip() for c in df.columns]
+df = df.copy()
 
-# ==============================
-# TARGET CLEAN
-# ==============================
-df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
-df = df[df[TARGET].notna()]
-df[TARGET] = df[TARGET].astype(int)
+# --- CAPACITA' DI RIENTRO
+df["CAPACITA_RIENTRO"] = df["CC_IMP_STIPEND_AVG_3M"] - df["F_IMP_SCONFNTO_TOT_UM"]
 
-# ==============================
-# CLEAN 9999 / SENTINEL
-# ==============================
-df = df.replace([9999, -9999], np.nan)
+# --- STRESS
+df["STRESS_RATIO"] = df["F_IMP_SCONFNTO_TOT_UM"] / (df["CC_IMP_STIPEND_AVG_3M"] + 1)
 
-# ==============================
-# DROP LEAKAGE (CRITICO)
-# ==============================
-LEAKAGE = [
-    "RATING_MINORE",
-    "FASCIA_RISCHIO",
-    "COD_FASCIA_RISCHIO",
-    "RECIDIVITA",
-    "FLAG_RECIDIVO",
-    "S_TREND_STATUS"
+# --- LIQUIDITA'
+df["LIQUIDITA_NETTA"] = df["CC_SALDO_AVG_3M"] - df["F_IMP_SCONFNTO_TOT_UM"]
+
+# --- ATTIVITA'
+df["ATTIVITA_3M"] = (
+    df["CC_IMP_CONTANTI_AVG_3M"] +
+    df["CC_IMP_UTENZE_AVG_3M"]
+)
+
+# --- LEVA (già esiste ma rinominiamo per chiarezza)
+df["LEVA_CF"] = df["F_PER_UTILZ_CF_UM"]
+
+# =========================================
+# 4. FEATURE SELECTION
+# =========================================
+
+drop_cols = [
+    TARGET,
+    ID_COL,
+    "MESE"   # opzionale
 ]
 
-df = df.drop(columns=[c for c in LEAKAGE if c in df.columns], errors="ignore")
+X = df.drop(columns=[c for c in drop_cols if c in df.columns])
+y = df[TARGET]
 
-# ==============================
-# FEATURE ENGINEERING (CHIAVE)
-# ==============================
+# =========================================
+# 5. IMPUTAZIONE
+# =========================================
 
-# protezione divisioni
-def safe_div(a, b):
-    return a / (b + 1e-6)
+X = X.fillna(X.median(numeric_only=True))
 
-# esempio colonne (adatta ai tuoi nomi reali)
-if "SALDO" in df.columns and "IMP_RATA_MENS" in df.columns:
-    df["buffer"] = safe_div(df["SALDO"], df["IMP_RATA_MENS"])
+# =========================================
+# 6. TRAIN TEST SPLIT
+# =========================================
 
-if "IMP_UTILZ_TOT" in df.columns and "SALDO" in df.columns:
-    df["util_ratio"] = safe_div(df["IMP_UTILZ_TOT"], df["SALDO"])
-
-if "NUM_STIPENDI_3M" in df.columns:
-    df["salary_regularity"] = df["NUM_STIPENDI_3M"] / 3
-
-if "SALDO" in df.columns and "SALDO_3M" in df.columns:
-    df["saldo_trend"] = df["SALDO"] - df["SALDO_3M"]
-
-# ==============================
-# FEATURE SET
-# ==============================
-exclude_cols = [TARGET, ID_COL]
-features = [c for c in df.columns if c not in exclude_cols]
-
-X = df[features].copy()
-y = df[TARGET].copy()
-
-# ==============================
-# NUMERIC ONLY (XGBoost friendly)
-# ==============================
-for col in X.columns:
-    X[col] = pd.to_numeric(X[col], errors="coerce")
-
-# imputazione semplice
-imputer = SimpleImputer(strategy="median")
-X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
-
-# ==============================
-# SPLIT
-# ==============================
 X_train, X_test, y_train, y_test = train_test_split(
     X, y,
-    test_size=TEST_SIZE,
-    random_state=RANDOM_STATE,
+    test_size=0.3,
+    random_state=42,
     stratify=y
 )
 
-# ==============================
-# MODELLO XGBOOST
-# ==============================
+# =========================================
+# 7. MODELLO XGBOOST
+# =========================================
+
 model = XGBClassifier(
-    n_estimators=300,
-    max_depth=5,
+    n_estimators=400,
+    max_depth=4,
     learning_rate=0.05,
     subsample=0.8,
     colsample_bytree=0.8,
-    random_state=RANDOM_STATE,
-    eval_metric="logloss"
+    eval_metric="auc",
+    random_state=42
 )
 
 model.fit(X_train, y_train)
 
-# ==============================
-# EVALUATION
-# ==============================
-y_pred = model.predict(X_test)
-y_prob = model.predict_proba(X_test)[:, 1]
+# =========================================
+# 8. PREDIZIONE
+# =========================================
+
+y_proba = model.predict_proba(X_test)[:,1]
+
+# soglia ottimizzata per recall tappeto
+threshold = 0.40
+y_pred = (y_proba > threshold).astype(int)
+
+# =========================================
+# 9. METRICHE
+# =========================================
 
 print("\n=== CLASSIFICATION REPORT ===")
 print(classification_report(y_test, y_pred))
 
 print("\n=== ROC AUC ===")
-print(roc_auc_score(y_test, y_prob))
+print(roc_auc_score(y_test, y_proba))
 
-# ==============================
-# FEATURE IMPORTANCE
-# ==============================
-importance = pd.DataFrame({
+# =========================================
+# 10. FEATURE IMPORTANCE
+# =========================================
+
+feat_imp = pd.DataFrame({
     "feature": X.columns,
     "importance": model.feature_importances_
 }).sort_values("importance", ascending=False)
 
 print("\n=== TOP FEATURE ===")
-print(importance.head(20))
+print(feat_imp.head(20))
 
-# ==============================
-# SCORING COMPLETO
-# ==============================
-df["prob_tappeto"] = model.predict_proba(X)[:, 1]
-df = df.sort_values("prob_tappeto", ascending=False)
+# =========================================
+# 11. SCORING COMPLETO
+# =========================================
+
+df_scored = df.copy()
+df_scored["prob_tappeto"] = model.predict_proba(X)[:,1]
+
+# =========================================
+# 12. SEGMENTAZIONE BUSINESS
+# =========================================
+
+def segment(x):
+    if x >= 0.7:
+        return "AUTO"        # si autoregola
+    elif x >= 0.4:
+        return "SOFT"        # reminder
+    else:
+        return "HARD"        # azione forte
+
+df_scored["segmento"] = df_scored["prob_tappeto"].apply(segment)
+
+# =========================================
+# 13. OUTPUT TOP CLIENTI
+# =========================================
+
+top = df_scored[[ID_COL, "prob_tappeto", "segmento"]]\
+        .sort_values("prob_tappeto", ascending=False)
 
 print("\n=== TOP CLIENTI ===")
-print(df[[ID_COL, "prob_tappeto"]].head(20))
+print(top.head(20))
