@@ -367,7 +367,29 @@ display(
     .reset_index(name="conteggio")
 )
 
+# =========================================================
+# FIX DATE (prima di selezione colonne)
+# =========================================================
 
+# se hai colonne tipo Dt cont → trasformale
+if "Dt cont" in X.columns:
+    X["DT_CONT_MESE"] = pd.to_datetime(X["Dt cont"], errors="coerce").dt.month
+    X["DT_CONT_GIORNO"] = pd.to_datetime(X["Dt cont"], errors="coerce").dt.day
+    X["DT_CONT_DAYOFWEEK"] = pd.to_datetime(X["Dt cont"], errors="coerce").dt.dayofweek
+    X = X.drop(columns=["Dt cont"])
+
+# rimuovi eventuali altre datetime rimaste
+date_cols = X.select_dtypes(include=["datetime64[ns]", "datetime64"]).columns.tolist()
+if len(date_cols) > 0:
+    print("Rimuovo colonne datetime:", date_cols)
+    X = X.drop(columns=date_cols, errors="ignore")
+
+# =========================================================
+# tipi colonna (CORRETTO)
+# =========================================================
+
+num_cols = X.select_dtypes(include=["number"]).columns.tolist()
+cat_cols = X.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 # =========================================================
 # 3. DROP COLONNE SPORCHE / LEAKAGE
 # =========================================================
