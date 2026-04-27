@@ -1,4 +1,77 @@
 # =========================================================
+# 14. APPLICA MODELLO A NUOVA LISTA NDG - MATCH COLONNE
+# =========================================================
+
+import os
+import joblib
+import pandas as pd
+
+NEW_FILE_PATH = r"C:\Users\D75737\Desktop\nuova_lista_ndg.xlsx"
+OUTPUT_FILE_PATH = r"C:\Users\D75737\Desktop\nuova_lista_ndg_scored.xlsx"
+
+# carico modello già salvato
+clf_loaded = joblib.load(model_path)
+
+# carico nuova lista
+df_new = pd.read_excel(NEW_FILE_PATH)
+
+print("Nuovo file:", df_new.shape)
+print("Colonne nuovo file:", df_new.columns.tolist())
+
+# colonne usate nel training
+# ATTENZIONE: questo funziona se X esiste ancora nel notebook
+training_cols = X.columns.tolist()
+
+# preparo X_new
+X_new = df_new.copy()
+
+# aggiungo colonne mancanti
+missing_cols = [c for c in training_cols if c not in X_new.columns]
+for c in missing_cols:
+    X_new[c] = 0
+
+# ignoro colonne extra
+extra_cols = [c for c in X_new.columns if c not in training_cols]
+
+print("Colonne mancanti aggiunte a 0:", missing_cols)
+print("Colonne extra ignorate:", extra_cols)
+
+# tengo solo colonne del training e nello stesso ordine
+X_new = X_new[training_cols].copy()
+
+# score
+df_new["score_tappeto"] = clf_loaded.predict_proba(X_new)[:, 1]
+
+# ranking
+df_new["rank_tappeto"] = df_new["score_tappeto"].rank(
+    ascending=False,
+    method="first"
+).astype(int)
+
+# flag soglia
+THRESHOLD_SCORING = 0.50
+df_new["flag_target_threshold"] = (df_new["score_tappeto"] >= THRESHOLD_SCORING).astype(int)
+
+# flag top 25%
+TOP_PCT = 0.25
+n_top = max(1, int(len(df_new) * TOP_PCT))
+
+df_new = df_new.sort_values("score_tappeto", ascending=False).reset_index(drop=True)
+df_new["flag_top_25pct"] = 0
+df_new.loc[:n_top-1, "flag_top_25pct"] = 1
+
+# salvo output
+df_new.to_excel(OUTPUT_FILE_PATH, index=False)
+
+print("=" * 80)
+print("SCORING COMPLETATO")
+print("File salvato:", OUTPUT_FILE_PATH)
+print("Clienti totali:", len(df_new))
+print("Target threshold >= 0.50:", int(df_new["flag_target_threshold"].sum()))
+print("Target top 25%:", int(df_new["flag_top_25pct"].sum()))
+print("=" * 80)
+
+display(df_new.head(40))# =========================================================
 # MODELLO V2 - CLUSTER TAPPETO OPERATIVO
 # Versione corretta con feature engineering su recidivita'
 # =========================================================
