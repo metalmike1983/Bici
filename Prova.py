@@ -1,21 +1,33 @@
 # ============================================================
-# MODELLO CLUSTER GESTIONE CLIENTI IN SCONFINO
-# Cluster30 / Cluster90 / Cluster180
+# MODELLO PROFILAZIONE CLIENTI IN SCONFINO
+# Cluster30 / Cluster90 / Cluster90+
+# Versione V2 con:
+# - rimozione leakage
+# - profiling cluster
+# - test statistici
+# - decision tree
+# - random forest
+# - gradient boosting
+# - feature importance
+# - score 0-100
+# - cliente tipo
+# - business insight automatici
+# - export Excel finale
 # ============================================================
 
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split
+from scipy.stats import kruskal, chi2_contingency
+
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.impute import SimpleImputer
-
-from scipy.stats import kruskal, chi2_contingency
 
 
 # ============================================================
@@ -23,27 +35,40 @@ from scipy.stats import kruskal, chi2_contingency
 # ============================================================
 
 INPUT_FILE = "dataset_clienti_cluster.xlsx"
-OUTPUT_FILE = "output_modello_cluster_gestione.xlsx"
+OUTPUT_FILE = "output_modello_cluster_gestione_v2.xlsx"
 
-ID_COL = "NDG2"
 TARGET_COL = "cluster"
 
-CLUSTER_ORDER = {
-    "cluster30": 1,
-    "cluster90": 2,
-    "cluster90+": 3,
-    "cluster180": 3
-}
+LEAKAGE_COLS = [
+    "gestione",
+    "giorni_gestione",
+    "max_giorni_gestione",
+    "num_gestioni",
+    "giorni_totali_gestione"
+]
+
+ID_COLS = [
+    "NDG",
+    "NDG2",
+    "ndg",
+    "ndg2",
+    "ID_CLIENTE",
+    "id_cliente"
+]
+
+TARGET_DERIVED_COLS = [
+    "target_ordinale"
+]
 
 
 # ============================================================
-# 2. CARICAMENTO DATASET
+# 2. CARICAMENTO
 # ============================================================
 
 df = pd.read_excel(INPUT_FILE)
 
 print("Righe dataset:", len(df))
-print("Colonne:", len(df.columns))
+print("Colonne iniziali:", len(df.columns))
 
 
 # ============================================================
@@ -52,62 +77,92 @@ print("Colonne:", len(df.columns))
 
 df[TARGET_COL] = df[TARGET_COL].astype(str).str.lower().str.strip()
 
-# Uniformo eventuali nomi
 df[TARGET_COL] = df[TARGET_COL].replace({
     "cluster 30": "cluster30",
+    "cluster_30": "cluster30",
     "cluster 90": "cluster90",
+    "cluster_90": "cluster90",
     "cluster 90+": "cluster90+",
-    "cluster180+": "cluster180"
+    "cluster_90+": "cluster90+",
+    "cluster180": "cluster90+",
+    "cluster180+": "cluster90+"
 })
 
-df = df[df[TARGET_COL].isin(CLUSTER_ORDER.keys())].copy()
+valid_clusters = ["cluster30", "cluster90", "cluster90+"]
+df = df[df[TARGET_COL].isin(valid_clusters)].copy()
 
-df["target_ordinale"] = df[TARGET_COL].map(CLUSTER_ORDER)
+cluster_rank = {
+    "cluster30": 30,
+    "cluster90": 60,
+    "cluster90+": 100
+}
 
+df["target_ordinale"] = df[TARGET_COL].map(cluster_rank)
+
+print("\nDistribuzione cluster:")
 print(df[TARGET_COL].value_counts())
 
 
 # ============================================================
-# 4. SEPARAZIONE FEATURE / TARGET
+# 4. RIMOZIONE VARIABILI DA NON USARE
 # ============================================================
 
-drop_cols = [TARGET_COL, "target_ordinale"]
-
-if ID_COL in df.columns:
-    drop_cols.append(ID_COL)
+drop_cols = (
+    [TARGET_COL]
+    + TARGET_DERIVED_COLS
+    + LEAKAGE_COLS
+    + ID_COLS
+)
 
 X = df.drop(columns=drop_cols, errors="ignore")
 y = df[TARGET_COL]
 
-
-# Rimuovo colonne completamente vuote
 X = X.dropna(axis=1, how="all")
+
+print("\nColonne dopo pulizia:", len(X.columns))
+
+print("\nControllo colonne escluse ancora presenti:")
+for c in LEAKAGE_COLS + ID_COLS:
+    if c in X.columns:
+        print("ATTENZIONE ancora presente:", c)
 
 
 # ============================================================
-# 5. IDENTIFICAZIONE VARIABILI NUMERICHE E CATEGORICHE
+# 5. IDENTIFICAZIONE NUMERICHE / CATEGORICHE
 # ============================================================
 
 numeric_features = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
 categorical_features = X.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 
-print("Variabili numeriche:", len(numeric_features))
+print("\nVariabili numeriche:", len(numeric_features))
 print("Variabili categoriche:", len(categorical_features))
 
 
 # ============================================================
-# 6. PROFILING STATISTICO PER CLUSTER
+# 6. PROFILING NUMERICO PER CLUSTER
 # ============================================================
 
-profile_numeric = df.groupby(TARGET_COL)[numeric_features].agg(
-    ["count", "mean", "median", "std", "min", "max"]
-)
+profile_numeric = df.groupby(TARGET_COL)[numeric_features].agg([
+    "count", "mean", "median", "std", "min", "max"
+])
 
-profile_categorical = {}
+cluster_median = df.groupby(TARGET_COL)[numeric_features].median().T
+cluster_mean = df.groupby(TARGET_COL)[numeric_features].mean().T
 
-for col in categorical_features:
-    tmp = pd.crosstab(df[TARGET_COL], df[col], normalize="index")
-    profile_categorical[col] = tmp
+for c in valid_clusters:
+    if c not in cluster_median.columns:
+        cluster_median[c] = np.nan
+
+cluster_profile = cluster_median[valid_clusters].copy()
+
+if "cluster30" in cluster_profile.columns and "cluster90+" in cluster_profile.columns:
+    cluster_profile["delta_90plus_vs_30"] = (
+        cluster_profile["cluster90+"] - cluster_profile["cluster30"]
+    )
+
+    cluster_profile["abs_delta_90plus_vs_30"] = (
+        cluster_profile["delta_90plus_vs_30"].abs()
+    )
 
 
 # ============================================================
@@ -116,11 +171,11 @@ for col in categorical_features:
 
 stat_tests = []
 
-# Numeriche: Kruskal-Wallis
 for col in numeric_features:
     groups = [
         df.loc[df[TARGET_COL] == c, col].dropna()
-        for c in df[TARGET_COL].unique()
+        for c in valid_clusters
+        if c in df[TARGET_COL].unique()
     ]
 
     groups = [g for g in groups if len(g) > 5]
@@ -137,8 +192,6 @@ for col in numeric_features:
         except Exception:
             pass
 
-
-# Categoriche: Chi-square
 for col in categorical_features:
     try:
         table = pd.crosstab(df[TARGET_COL], df[col])
@@ -153,11 +206,20 @@ for col in categorical_features:
     except Exception:
         pass
 
-stat_tests_df = pd.DataFrame(stat_tests).sort_values("p_value")
+stat_tests_df = pd.DataFrame(stat_tests)
+
+if len(stat_tests_df) > 0:
+    stat_tests_df = stat_tests_df.sort_values("p_value")
+    stat_tests_df["significant_005"] = stat_tests_df["p_value"] < 0.05
+    stat_tests_df["significance"] = pd.cut(
+        stat_tests_df["p_value"],
+        bins=[-1, 0.001, 0.01, 0.05, 1],
+        labels=["***", "**", "*", ""]
+    )
 
 
 # ============================================================
-# 8. PREPROCESSING MODELLO
+# 8. PREPROCESSING
 # ============================================================
 
 numeric_transformer = Pipeline(steps=[
@@ -192,80 +254,91 @@ X_train, X_test, y_train, y_test = train_test_split(
 
 
 # ============================================================
-# 10. MODELLO 1 - DECISION TREE INTERPRETABILE
+# 10. MODELLI
 # ============================================================
 
 tree_model = Pipeline(steps=[
     ("preprocessor", preprocessor),
     ("model", DecisionTreeClassifier(
         max_depth=4,
-        min_samples_leaf=50,
+        min_samples_leaf=80,
         class_weight="balanced",
         random_state=42
     ))
 ])
 
-tree_model.fit(X_train, y_train)
-
-y_pred_tree = tree_model.predict(X_test)
-
-print("\n=== DECISION TREE ===")
-print(classification_report(y_test, y_pred_tree))
-print(confusion_matrix(y_test, y_pred_tree))
-
-
-# ============================================================
-# 11. MODELLO 2 - RANDOM FOREST
-# ============================================================
-
 rf_model = Pipeline(steps=[
     ("preprocessor", preprocessor),
     ("model", RandomForestClassifier(
-        n_estimators=300,
+        n_estimators=400,
         max_depth=8,
-        min_samples_leaf=30,
+        min_samples_leaf=40,
         class_weight="balanced",
         random_state=42,
         n_jobs=-1
     ))
 ])
 
-rf_model.fit(X_train, y_train)
-
-y_pred_rf = rf_model.predict(X_test)
-y_proba_rf = rf_model.predict_proba(X_test)
-
-print("\n=== RANDOM FOREST ===")
-print(classification_report(y_test, y_pred_rf))
-print(confusion_matrix(y_test, y_pred_rf))
-
-
-# ============================================================
-# 12. MODELLO 3 - GRADIENT BOOSTING
-# ============================================================
-
 gb_model = Pipeline(steps=[
     ("preprocessor", preprocessor),
     ("model", GradientBoostingClassifier(
-        n_estimators=200,
-        learning_rate=0.05,
+        n_estimators=250,
+        learning_rate=0.04,
         max_depth=3,
         random_state=42
     ))
 ])
 
-gb_model.fit(X_train, y_train)
+models = {
+    "Decision Tree": tree_model,
+    "Random Forest": rf_model,
+    "Gradient Boosting": gb_model
+}
 
-y_pred_gb = gb_model.predict(X_test)
-y_proba_gb = gb_model.predict_proba(X_test)
+model_reports = {}
+confusion_matrices = {}
 
-print("\n=== GRADIENT BOOSTING ===")
-print(classification_report(y_test, y_pred_gb))
-print(confusion_matrix(y_test, y_pred_gb))
+for name, model in models.items():
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+
+    print(f"\n=== {name.upper()} ===")
+    print(classification_report(y_test, pred))
+    print(confusion_matrix(y_test, pred))
+
+    model_reports[name] = classification_report(
+        y_test,
+        pred,
+        output_dict=True
+    )
+
+    confusion_matrices[name] = pd.DataFrame(
+        confusion_matrix(y_test, pred),
+        index=[f"actual_{c}" for c in model.named_steps["model"].classes_],
+        columns=[f"pred_{c}" for c in model.named_steps["model"].classes_]
+    )
 
 
 # ============================================================
-# 13. FEATURE IMPORTANCE RANDOM FOREST
+# 11. CROSS VALIDATION RANDOM FOREST
+# ============================================================
+
+cv_scores = cross_val_score(
+    rf_model,
+    X,
+    y,
+    cv=5,
+    scoring="f1_weighted"
+)
+
+cv_summary = pd.DataFrame({
+    "metric": ["cv_f1_weighted_mean", "cv_f1_weighted_std"],
+    "value": [cv_scores.mean(), cv_scores.std()]
+})
+
+
+# ============================================================
+# 12. FEATURE NAMES COMPATIBILE CON SKLEARN VECCHIO
 # ============================================================
 
 def get_feature_names(preprocessor):
@@ -276,11 +349,20 @@ def get_feature_names(preprocessor):
 
     if categorical_features:
         cat_encoder = preprocessor.named_transformers_["cat"].named_steps["encoder"]
-        cat_names = cat_encoder.get_feature_names_out(categorical_features)
+
+        try:
+            cat_names = cat_encoder.get_feature_names_out(categorical_features)
+        except AttributeError:
+            cat_names = cat_encoder.get_feature_names(categorical_features)
+
         feature_names.extend(cat_names)
 
     return feature_names
 
+
+# ============================================================
+# 13. FEATURE IMPORTANCE RANDOM FOREST
+# ============================================================
 
 rf_preprocessor = rf_model.named_steps["preprocessor"]
 rf_classifier = rf_model.named_steps["model"]
@@ -292,36 +374,40 @@ feature_importance = pd.DataFrame({
     "importance": rf_classifier.feature_importances_
 }).sort_values("importance", ascending=False)
 
+top_features = feature_importance.head(30)
+
 
 # ============================================================
-# 14. MANAGEMENT PERSISTENCE SCORE 0-100
+# 14. SCORE 0-100
 # ============================================================
 
-classes = rf_classifier.classes_
-
-score_weights = {
-    "cluster30": 30,
-    "cluster90": 60,
-    "cluster90+": 90,
-    "cluster180": 100
-}
-
+rf_classes = rf_classifier.classes_
 proba_full = rf_model.predict_proba(X)
 
-score_df = pd.DataFrame(proba_full, columns=[f"prob_{c}" for c in classes])
+score_df = pd.DataFrame(
+    proba_full,
+    columns=[f"prob_{c}" for c in rf_classes]
+)
 
 score = np.zeros(len(score_df))
 
-for c in classes:
-    score += score_df[f"prob_{c}"] * score_weights.get(c, 0)
+for c in rf_classes:
+    score += score_df[f"prob_{c}"] * cluster_rank.get(c, 0)
 
 score_df["management_persistence_score"] = score
 score_df["predicted_cluster"] = rf_model.predict(X)
+score_df["actual_cluster"] = df[TARGET_COL].values
 
-if ID_COL in df.columns:
-    score_df[ID_COL] = df[ID_COL].values
+for id_col in ID_COLS:
+    if id_col in df.columns:
+        score_df[id_col] = df[id_col].values
 
-score_df[TARGET_COL] = df[TARGET_COL].values
+score_df["score_band"] = pd.cut(
+    score_df["management_persistence_score"],
+    bins=[0, 40, 70, 100],
+    labels=["Low persistence", "Medium persistence", "High persistence"],
+    include_lowest=True
+)
 
 
 # ============================================================
@@ -330,7 +416,6 @@ score_df[TARGET_COL] = df[TARGET_COL].values
 
 tree_classifier = tree_model.named_steps["model"]
 tree_preprocessor = tree_model.named_steps["preprocessor"]
-
 tree_feature_names = get_feature_names(tree_preprocessor)
 
 tree_rules = export_text(
@@ -343,30 +428,184 @@ print(tree_rules)
 
 
 # ============================================================
-# 16. PROFILO MEDIO PER CLUSTER
+# 16. PROFILO CLIENTE TIPO PER CLUSTER
 # ============================================================
 
-cluster_summary = df.groupby(TARGET_COL)[numeric_features].median().T
+cliente_tipo_rows = []
 
-cluster_summary["delta_180_vs_30"] = (
-    cluster_summary.get("cluster180", cluster_summary.iloc[:, -1])
-    - cluster_summary.get("cluster30", cluster_summary.iloc[:, 0])
+for cluster in valid_clusters:
+    if cluster not in df[TARGET_COL].unique():
+        continue
+
+    subset = df[df[TARGET_COL] == cluster]
+
+    for col in numeric_features:
+        cliente_tipo_rows.append({
+            "cluster": cluster,
+            "variable": col,
+            "mean": subset[col].mean(),
+            "median": subset[col].median(),
+            "p25": subset[col].quantile(0.25),
+            "p75": subset[col].quantile(0.75),
+            "missing_rate": subset[col].isna().mean()
+        })
+
+cliente_tipo_df = pd.DataFrame(cliente_tipo_rows)
+
+
+# ============================================================
+# 17. BUSINESS INSIGHT AUTOMATICI
+# ============================================================
+
+insights = []
+
+if len(stat_tests_df) > 0:
+    significant_vars = stat_tests_df[
+        stat_tests_df["significant_005"] == True
+    ]["variable"].tolist()
+else:
+    significant_vars = []
+
+top_important_vars = top_features["feature"].head(20).tolist()
+
+common_vars = [
+    v for v in top_important_vars
+    if v in numeric_features and v in significant_vars
+]
+
+for var in common_vars[:15]:
+    try:
+        c30 = cluster_profile.loc[var, "cluster30"]
+        c90 = cluster_profile.loc[var, "cluster90"]
+        c90p = cluster_profile.loc[var, "cluster90+"]
+
+        if pd.notna(c30) and pd.notna(c90p):
+            direction = "higher" if c90p > c30 else "lower"
+
+            insights.append({
+                "variable": var,
+                "business_insight": (
+                    f"{var}: median value is {direction} in cluster90+ "
+                    f"than in cluster30. "
+                    f"cluster30={c30:.2f}, cluster90={c90:.2f}, cluster90+={c90p:.2f}."
+                )
+            })
+    except Exception:
+        pass
+
+business_insights_df = pd.DataFrame(insights)
+
+
+# ============================================================
+# 18. PROFILO COMPARATIVO CLUSTER
+# ============================================================
+
+cluster_comparison = cluster_profile.copy()
+
+if len(stat_tests_df) > 0:
+    pvals = stat_tests_df.set_index("variable")["p_value"].to_dict()
+    cluster_comparison["p_value"] = cluster_comparison.index.map(pvals)
+    cluster_comparison["significant_005"] = cluster_comparison["p_value"] < 0.05
+
+cluster_comparison = cluster_comparison.sort_values(
+    "abs_delta_90plus_vs_30",
+    ascending=False
 )
 
 
 # ============================================================
-# 17. EXPORT EXCEL
+# 19. REPORT MODELLI IN DATAFRAME
+# ============================================================
+
+model_report_rows = []
+
+for model_name, report in model_reports.items():
+    for label, metrics in report.items():
+        if isinstance(metrics, dict):
+            row = {"model": model_name, "label": label}
+            row.update(metrics)
+            model_report_rows.append(row)
+        else:
+            model_report_rows.append({
+                "model": model_name,
+                "label": label,
+                "value": metrics
+            })
+
+model_report_df = pd.DataFrame(model_report_rows)
+
+
+# ============================================================
+# 20. EXPORT EXCEL
 # ============================================================
 
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-    profile_numeric.to_excel(writer, sheet_name="profiling_numeric")
-    stat_tests_df.to_excel(writer, sheet_name="stat_tests", index=False)
-    feature_importance.to_excel(writer, sheet_name="feature_importance", index=False)
-    score_df.to_excel(writer, sheet_name="scores_clienti", index=False)
-    cluster_summary.to_excel(writer, sheet_name="cluster_summary")
+
+    pd.DataFrame(df[TARGET_COL].value_counts()).to_excel(
+        writer,
+        sheet_name="00_cluster_distribution"
+    )
+
+    model_report_df.to_excel(
+        writer,
+        sheet_name="01_model_performance",
+        index=False
+    )
+
+    cv_summary.to_excel(
+        writer,
+        sheet_name="02_cross_validation",
+        index=False
+    )
+
+    feature_importance.to_excel(
+        writer,
+        sheet_name="03_feature_importance",
+        index=False
+    )
+
+    cluster_comparison.to_excel(
+        writer,
+        sheet_name="04_cluster_comparison"
+    )
+
+    stat_tests_df.to_excel(
+        writer,
+        sheet_name="05_stat_tests",
+        index=False
+    )
+
+    cliente_tipo_df.to_excel(
+        writer,
+        sheet_name="06_cliente_tipo",
+        index=False
+    )
+
+    score_df.to_excel(
+        writer,
+        sheet_name="07_scores_clienti",
+        index=False
+    )
+
+    business_insights_df.to_excel(
+        writer,
+        sheet_name="08_business_insights",
+        index=False
+    )
 
     pd.DataFrame({
         "decision_tree_rules": tree_rules.split("\n")
-    }).to_excel(writer, sheet_name="decision_tree_rules", index=False)
+    }).to_excel(
+        writer,
+        sheet_name="09_decision_tree_rules",
+        index=False
+    )
+
+    for name, cm in confusion_matrices.items():
+        safe_name = name.replace(" ", "_")[:20]
+        cm.to_excel(
+            writer,
+            sheet_name=f"CM_{safe_name}"
+        )
 
 print(f"\nFile esportato: {OUTPUT_FILE}")
